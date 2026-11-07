@@ -1,0 +1,18 @@
+- insert:
+    - id: dsh-endnote
+      name: dsh-endnote
+      config:
+        # EndNote 文献库根目录（.Data 目录），只读访问。
+        # 留空则用默认位置 ~/Documents/My EndNote Library.Data；
+        # 实际库在别处时，在侧栏 dsh-endnote 配置页里选一次即可（保存立即生效）。
+        libraryPath: ''
+        # 索引文件（.json / .csv）：留空则自动使用插件数据目录里自建的索引
+        indexFile: ''
+        # 索引缓存与自建索引的存放目录，留空为 <插件目录>/.data
+        dataDir: ''
+        # 重建索引时调用的 Python 解释器
+        pythonPath: python
+        # 检索命中后是否自动在右侧栏打开 PDF
+        openInSidebar: true
+        # 单次检索默认返回条数
+        limit: 8

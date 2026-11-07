@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-endnote",
+    "description": "Searches the local EndNote library before any literature research and opens the matching PDF in the right sidebar."
+  }
+}

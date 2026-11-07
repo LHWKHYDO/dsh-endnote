@@ -1,0 +1,16 @@
+# 依赖
+node_modules/
+
+# 本地索引、阅读日志与缓存（含本机绝对路径与文献元数据，勿提交）
+.data/
+*.log
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 临时文件
+*.tmp
+tmp/

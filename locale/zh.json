@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-endnote",
+    "description": "文献调研先查本地 EndNote 库，命中后把 PDF 在右侧栏打开，方便边读边聊。"
+  }
+}

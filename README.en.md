@@ -1,0 +1,123 @@
+# dsh-endnote
+
+[English](README.md) | 简体中文
+
+A literature-research plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): **search your local EndNote library first, then read the original PDF**. When you ask for papers on a topic, the model queries your local EndNote library and opens the matching PDF in the DSH right sidebar, so you can read and ask follow-up questions side by side.
+
+- **Read-only**: the EndNote library is never written to; index artifacts stay inside the plugin's own data directory.
+- **Local first, web second**: the injected system prompt requires `endnote_search` before any web search. Only on a local miss does the model look up the canonical title/DOI online, re-query the library with those fields, and finally list web candidates if still unmatched.
+- **Open what you found**: `endnote_open` verifies the PDF exists and hands it to the host PDF viewer — only for results opened in the current session.
+- **Sidebar panel**: library overview with totals, recent reads / recently added (choose count, or one/both lists), and one-click refresh; titles and folders are links that open your file manager.
+
+## How it works
+
+```
+user asks for literature
+        │
+        ▼
+injected system prompt ──► call endnote_search first, never search the web first
+        │
+        ▼
+  endnote_search ── hit ──► title + groups + abstract + local PDF path
+        │
+        ▼
+  endnote_open(path) ── verify file exists ──► meta {plugin, path, open}
+        │
+        ▼
+client half ──► open the file in the right sidebar with the host PDF viewer
+```
+
+## Requirements
+
+- DSH desktop app or `dsh web` (the right sidebar and plugin settings page are needed for the full experience; plain CLI still gets the tools)
+- EndNote installed locally, with a `…Data` library folder
+- Python 3 (only for rebuilding the index with `endnote_rebuild`)
+- Node.js 20+ (to run the plugin and its tests); no build step
+
+## Install
+
+```sh
+git clone https://github.com/LHWHKHYDO/dsh-endnote.git
+cd dsh-endnote && npm install --omit=dev   # single dependency: @deepseek-ai/schemastery
+```
+
+Then install that folder from the DSH sidebar → Plugins → plugin manager (equivalent to `plugin_manager` `install_bundle` with `target` set to the repo path). Hard-refresh the browser afterwards (Ctrl+Shift+R). A `dsh-endnote` card appears on the Plugins page, plus an entry in the sidebar navigation.
+
+### First run
+
+1. Sidebar → `dsh-endnote` → settings → **Add** your `My EndNote Library.Data` folder → click **Switch**.
+2. Run `endnote_rebuild` once to build the index (or run `python scripts/endnote_index.py --lib "<library>.Data" --out "<plugin>/.data/endnote_index.json"` manually).
+3. Check `endnote_status` for entry count / PDF count.
+
+## Configuration
+
+Configuration lives in the plugin entry's `config` (`cordis.patch.yml`); the graphical settings page is recommended. All fields are volatile — **saved changes apply immediately, no restart**.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `libraryPath` | `~/Documents/My EndNote Library.Data` | Active library root (`…Data`), read-only; **Switch** in the settings page changes it |
+| `libraries` | `[]` | Saved libraries, each `{name, path}`; the first is primary; add / remove / set primary / switch |
+| `indexFile` | empty | Index file (`.json` / `.csv`). Empty = per-library index `endnote_index_<key>.json` → legacy single file in data dir → legacy candidates |
+| `dataDir` | `<plugin>/.data` | Directory for indexes, read log and cache |
+| `pythonPath` | `python` | Interpreter used by `endnote_rebuild` |
+| `openInSidebar` | `true` | Auto-open the PDF in the right sidebar on a hit |
+| `limit` | `8` | Default number of results per search |
+
+**Multiple libraries**: each library has its own index. The first switch to a library without an index just needs one `endnote_rebuild`; afterwards switching is instant. Paths in the index are re-joined against the current `libraryPath`, so moving a library only needs a config change — no rebuild.
+
+## Tools
+
+| Tool | Purpose |
+| --- | --- |
+| `endnote_search` | Search the local library. Multiple keywords are AND, covering title / authors / year / journal / keywords / DOI / type / groups / attachment path / abstract; supports `group` filtering and `read=read/unread`, and shows read state and rating per hit |
+| `endnote_open` | Verify the PDF exists and open it in the right sidebar (path only when `openInSidebar=false`); successful opens are logged |
+| `endnote_recent` | Recently read table (newest first): title / read state / rating / last-read time / local folder; data = open log + EndNote read-state timestamps |
+| `endnote_status` | Library path, saved libraries, index file, entry count, read count, PDF count, auto-open flag |
+| `endnote_config` | Write plugin config through the host `configEditor`; applies immediately |
+| `endnote_rebuild` | Run `scripts/endnote_index.py` to rebuild the index and reconcile registered vs on-disk PDFs |
+
+## Sidebar panel
+
+The `dsh-endnote` panel page starts with a dashboard and the settings form below it:
+
+- **Totals**: total entries / with PDF / read / unread / unmarked / rated / groups + index timestamp.
+- **Recent reads**: count 5/10/20/50; each row shows title, read state, rating and last-read time; title and folder are links that open the containing folder in your file manager.
+- **Recently added**: the **Show** dropdown selects *Recent reads / Recently added / Both*, ordered by EndNote import time.
+- **Refresh**: re-fetch the displayed data (read log and read-state changes appear right away; newly imported papers need an `endnote_rebuild` to enter the totals).
+
+Data flows over two same-origin routes, `GET /dsh-endnote/panel-data` and `POST /dsh-endnote/open-folder`, registered the same way as the official open-in-app: every request passes the host `connection` Host/Origin fence, and folder opening only accepts absolute paths to real directories. If `webServer` / `connection` is missing the routes degrade silently; the six tools are unaffected.
+
+## Index
+
+`scripts/endnote_index.py` does three things only: open `sdb/sdb.eni` read-only (SQLite, `mode=ro&immutable=1`) to read references, groups, attachment mapping, read state, ratings and timestamps; scan the `PDF/` directory read-only for reconciliation; write the result as one JSON file.
+
+```sh
+python scripts/endnote_index.py --lib "<library>.Data" --out "<plugin>/.data/endnote_index.json"
+```
+
+## Privacy
+
+- The EndNote library is **read-only**; the index script opens the database with `immutable=1` and performs no writes.
+- Apart from your normal conversation with the model, the plugin **sends no data anywhere**; searching, opening and the panel are all local.
+- The index and read log under `.data/` contain local absolute paths and reference metadata — **excluded by `.gitignore`**; do not commit them.
+
+## Known limitations
+
+- The client half depends on the `sidebarRight` and `sessions` services; when missing it degrades quietly (one warning) and the tools still work.
+- Opening the same PDF again focuses the existing tab (host default dedupe).
+- Auto-open only applies to `endnote_open` calls made in the current session; past sessions are not replayed.
+
+## Development
+
+Plain JavaScript, no build step. Tests use Node's built-in runner:
+
+```sh
+node test/core.test.mjs
+node test/tools.test.mjs
+node test/client.test.mjs
+# or npm test (requires an environment that can spawn child processes)
+```
+
+## License
+
+MIT
