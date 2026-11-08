@@ -32,16 +32,19 @@ client half ──► open the file in the right sidebar with the host PDF viewe
 - DSH desktop app or `dsh web` (the right sidebar and plugin settings page are needed for the full experience; plain CLI still gets the tools)
 - EndNote installed locally, with a `…Data` library folder
 - Python 3 (only for rebuilding the index with `endnote_rebuild`)
-- Node.js 20+ (to run the plugin and its tests); no build step
+- Node.js 18+ (to run the plugin and its tests); no build step
 
 ## Install
 
 ```sh
-git clone https://github.com/LHWHKHYDO/dsh-endnote.git
-cd dsh-endnote && npm install --omit=dev   # single dependency: @deepseek-ai/schemastery
+git clone https://github.com/LHWKHYDO/dsh-endnote.git
 ```
 
+**The repo vendors `vendor/` (a copy of schemastery and its deps): there are no npm dependencies, no `npm install`, and no network access needed** — clone and install. This exists for offline/new machines: installing from the repo used to pull `@deepseek-ai/schemastery` from the npm registry, and an unreachable registry or missing version surfaced as an "incompatible version / no matching version" error.
+
 Then install that folder from the DSH sidebar → Plugins → plugin manager (equivalent to `plugin_manager` `install_bundle` with `target` set to the repo path). Hard-refresh the browser afterwards (Ctrl+Shift+R). A `dsh-endnote` card appears on the Plugins page, plus an entry in the sidebar navigation.
+
+> Compatibility: the plugin declares no `engines.dsh` and no DSH package peer dependencies, so DSH's version compatibility check never blocks it; any DSH build with the plugin manager and sidebar works.
 
 ### First run
 

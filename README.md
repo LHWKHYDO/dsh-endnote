@@ -32,16 +32,19 @@
 - DSH 桌面版或 `dsh web`（需要右侧栏与侧栏插件页；纯 CLI 也能用工具，只是不弹预览）
 - 本机装有 EndNote，且有一个 `…Data` 库目录
 - Python 3（仅 `endnote_rebuild` 重建索引时需要）
-- Node.js 20+（运行插件与测试）；无需构建步骤
+- Node.js 18+（运行插件与测试）；无需构建步骤
 
 ## 安装
 
 ```sh
 git clone https://github.com/<your-name>/dsh-endnote.git
-cd dsh-endnote && npm install --omit=dev   # 仅装一个依赖：@deepseek-ai/schemastery
 ```
 
+**本仓库自带 `vendor/`（schemastery 及其依赖的副本），没有 npm 依赖、不需要 `npm install`、也不需要联网**——直接克隆后就能装。这一点专门为离线/新机器准备：以前从仓库安装时会去 npm 拉 `@deepseek-ai/schemastery`，注册表不可达或版本缺失就会报「不兼容版本 / 找不到匹配版本」。
+
 然后在 DSH 侧栏「插件」页用插件管理器选择该目录安装（等价于 `plugin_manager: install_bundle`，`target` 传仓库路径）。装完强刷浏览器（Ctrl+Shift+R）。侧栏「插件」页会出现 `dsh-endnote` 卡片，侧栏导航也有同名入口。
+
+> 兼容性：插件不声明 `engines.dsh`，也不声明任何 DSH 包 peer 依赖，所以 DSH 的版本兼容检查不会拦它；只要 DSH 带「插件管理器 + 侧栏」即可安装。
 
 ### 首次使用
 
@@ -84,6 +87,7 @@ cd dsh-endnote && npm install --omit=dev   # 仅装一个依赖：@deepseek-ai/s
 - **最近阅读**：条数可选（5/10/20/50），每行显示标题、已读状态、评分与最近阅读时间；标题与文件夹都是超链接，点击用系统文件管理器打开所在文件夹。
 - **最近导入**：顶部「显示」下拉框可选「最近阅读 / 最近导入 / 两者都显示」，按 EndNote 入库时间倒序。
 - **刷新**：重新拉取展示数据（阅读记录、读状态变化点刷新即见；新导入文献要先 `endnote_rebuild` 才进统计）。
+- **侧栏入口**：页面顶部一行显示侧栏入口状态；已注册可点「打开面板」，未注册（客户端半边晚于页面加载）可点「固定到侧栏」补注册，或用「重新加载页面」刷新一次。入口本身注册一次后每次启动都会自动常驻左侧栏。
 
 数据走两条同源路由：`GET /dsh-endnote/panel-data`、`POST /dsh-endnote/open-folder`，与官方 open-in-app 同款注册方式——每条请求先过宿主 `connection` 的 Host/Origin 栅栏，打开文件夹只接受绝对路径且必须是真实目录。`webServer` / `connection` 缺失时路由自动降级，六个工具不受影响。
 

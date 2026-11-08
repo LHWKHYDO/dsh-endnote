@@ -77,6 +77,13 @@ window.__ModuleLoader__.load({
         dashAddedEmpty: 'The index has no added-at timestamps.',
         dashLoadFailed: 'Failed to load panel data.',
         openFailed: 'Could not open that folder.',
+        sidebarTitle: 'Sidebar entry',
+        sidebarOn: 'shown in the left sidebar',
+        sidebarMissing: 'not registered on this page yet',
+        sidebarOpen: 'Open panel',
+        sidebarAdd: 'Add to sidebar',
+        sidebarReload: 'Reload page',
+        sidebarHint: 'The sidebar row stays put after every launch; it only has to be registered once per page load.',
       },
       zh: {
         intro: '选择本地 EndNote 库目录（*.Data 文件夹）。保存后立即生效，无需重启插件。',
@@ -133,6 +140,13 @@ window.__ModuleLoader__.load({
         dashAddedEmpty: '索引里没有入库时间。',
         dashLoadFailed: '面板数据加载失败。',
         openFailed: '无法打开该文件夹。',
+        sidebarTitle: '侧栏入口',
+        sidebarOn: '已显示在左侧栏',
+        sidebarMissing: '本页尚未注册',
+        sidebarOpen: '打开面板',
+        sidebarAdd: '固定到侧栏',
+        sidebarReload: '重新加载页面',
+        sidebarHint: '注册一次后每次启动都会自动出现在侧栏；插件更新后需刷新页面一次。',
       },
     }
 
@@ -192,6 +206,11 @@ window.__ModuleLoader__.load({
       '.dshEndnoteCfg_linkBtn:disabled{color:var(--dsw-alias-label-tertiary);cursor:default}',
       '.dshEndnoteCfg_rowPath{flex:1;min-width:0;max-width:none;font-size:12px;color:var(--dsw-alias-label-tertiary)}',
       '.dshEndnoteCfg_rowMeta{flex:none;font-size:12px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}',
+      '.dshEndnoteCfg_sideRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1)}',
+      '.dshEndnoteCfg_sideLabel{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary)}',
+      '.dshEndnoteCfg_sideState{font-size:12px;color:var(--dsw-alias-label-tertiary)}',
+      '.dshEndnoteCfg_sideState.is-missing{color:var(--dsw-alias-label-secondary)}',
+      '.dshEndnoteCfg_sideHint{margin:0;font-size:11px;color:var(--dsw-alias-label-tertiary)}',
     ].join('')
 
     /** 快照里的数组字段取值：volatile 数组可能以 { get() } 访问器到达。 */
@@ -772,8 +791,91 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** 已注册到某 slot 的 id/key 列表（无 entriesOfSlot 时按空处理）。 */
+      const slotIds = (name, prop) => {
+        if (typeof slots.entriesOfSlot !== 'function') return []
+        try {
+          const entries = slots.entriesOfSlot(name)
+          if (!Array.isArray(entries)) return []
+          return entries
+            .map((entry) => (entry && entry.options ? entry.options[prop] : undefined))
+            .filter((value) => typeof value === 'string' && value.length > 0)
+        } catch {
+          return []
+        }
+      }
+      const hasPanelRow = () => slotIds('sidebar.panellist', 'id').indexOf(PANEL_NAME) !== -1
+      const hasPanelPage = () => slotIds('main', 'key').indexOf(PANEL_NAME) !== -1
+
+      const registerPanelRow = () =>
+        slots.inject('sidebar.panellist', () =>
+          slots.register({
+            name: 'sidebar.panellist',
+            id: PANEL_NAME,
+            order: 20,
+            locale: SETTINGS_NS,
+            label: PANEL_NAME,
+          }, PanelIcon))
+      const registerPanelPage = () =>
+        slots.inject('main', () =>
+          slots.register({
+            name: 'main',
+            key: PANEL_NAME,
+            locale: SETTINGS_NS,
+            inject: () => ({}),
+          }, PanelPage))
+
+      /** 侧栏入口补注册：客户端半边晚于页面加载就绪、或首轮注册失败时一键补上。 */
+      const ensurePanelEntries = () => {
+        try {
+          if (!hasPanelRow()) registerPanelRow()
+          if (!hasPanelPage()) registerPanelPage()
+        } catch (error) {
+          console.warn('[' + PLUGIN + '] 补注册侧栏入口失败', error)
+        }
+      }
+
+      /** 切到本插件的面板页；layout 服务可能晚于本插件就绪，调用时再取。 */
+      const selectPanel = () => {
+        const layout = get('layout')
+        if (layout && typeof layout.selectPanel === 'function') layout.selectPanel(PANEL_NAME)
+      }
+
+      /** 顶部「侧栏入口」行：显示状态 + 打开面板 / 固定到侧栏 / 重新加载页面。 */
+      const SidebarEntryRow = (props) => {
+        const h = React.createElement
+        const t = typeof props.t === 'function' ? props.t : (key) => key
+        const [, setTick] = React.useState(0)
+        const present = hasPanelRow()
+        const reload = () => {
+          if (typeof window !== 'undefined' && window.location) window.location.reload()
+        }
+        const pin = () => {
+          ensurePanelEntries()
+          setTick((n) => n + 1)
+          // slot 订阅刷新是异步的，等一拍再切到面板页。
+          setTimeout(selectPanel, 0)
+        }
+        const actions = present
+          ? [h('button', { key: 'open', className: 'dshEndnoteCfg_btn dshEndnoteCfg_btnSm', type: 'button', onClick: selectPanel }, t('sidebarOpen'))]
+          : [
+              h('button', { key: 'pin', className: 'dshEndnoteCfg_btn dshEndnoteCfg_btnSm', type: 'button', onClick: pin }, t('sidebarAdd')),
+              h('button', { key: 'reload', className: 'dshEndnoteCfg_btn dshEndnoteCfg_btnSm', type: 'button', onClick: reload }, t('sidebarReload')),
+            ]
+        return h('div', { className: 'dshEndnoteCfg_sideRow' },
+          h('span', { className: 'dshEndnoteCfg_sideLabel' }, t('sidebarTitle')),
+          h('span', { className: 'dshEndnoteCfg_sideState' + (present ? '' : ' is-missing') }, present ? t('sidebarOn') : t('sidebarMissing')),
+          ...actions,
+          h('p', { className: 'dshEndnoteCfg_sideHint' }, t('sidebarHint')),
+        )
+      }
+
+      /** 配置页（插件行 / 组合包页）：侧栏入口行 + 配置表单。 */
       const Page = (slotProps) =>
-        React.createElement(EndnoteSettings, Object.assign({}, slotProps, { scope, pickDirectory }))
+        React.createElement(React.Fragment, null,
+          React.createElement(SidebarEntryRow, { t: slotProps && slotProps.t }),
+          React.createElement(EndnoteSettings, Object.assign({}, slotProps, { scope, pickDirectory })),
+        )
 
       // 侧栏「dsh-endnote」面板页：整页是滚动容器（main slot 的锚点 display:contents，
       // 本 div 直接成为 mainPanel 的 flex 子项，用 flex:1+min-height:0+overflow-y:auto
@@ -787,6 +889,7 @@ window.__ModuleLoader__.load({
         return h('div', { className: 'dshEndnoteCfg_panel' },
           h('div', { className: 'dshEndnoteCfg_pageBody' },
             h('h2', { className: 'dshEndnoteCfg_heading' }, PANEL_NAME),
+            h(SidebarEntryRow, { t }),
             h(EndnoteDashboard, { t }),
             h(EndnoteSettings, Object.assign({}, slotProps, { t, scope: liveScope, pickDirectory })),
           ),
@@ -794,43 +897,40 @@ window.__ModuleLoader__.load({
       }
 
       ctx.effect(() => {
-        const offRow = slots.inject('plugins.row.config', () =>
-          slots.register({
-            name: 'plugins.row.config',
-            key: ROW_KEY,
-            locale: SETTINGS_NS,
-            inject: () => ({}),
-          }, Page))
+        const offs = []
+        /** 逐个注册：任一 slot 注册失败不连坐其它入口。 */
+        const mount = (label, register) => {
+          try {
+            const off = register()
+            if (typeof off === 'function') offs.push(off)
+          } catch (error) {
+            console.warn('[' + PLUGIN + '] 注册 ' + label + ' 失败', error)
+          }
+        }
+        mount('plugins.row.config', () =>
+          slots.inject('plugins.row.config', () =>
+            slots.register({
+              name: 'plugins.row.config',
+              key: ROW_KEY,
+              locale: SETTINGS_NS,
+              inject: () => ({}),
+            }, Page)))
         // 组合包页：描述与行之间直接渲染配置区（比行页更显眼，两处都注册）。
-        const offBundle = slots.inject('plugins.bundle.config', () =>
-          slots.register({
-            name: 'plugins.bundle.config',
-            key: BUNDLE_KEY,
-            locale: SETTINGS_NS,
-            inject: () => ({}),
-          }, Page))
-        // 侧栏导航行（新会话/插件/自动化任务…那一列）；同一 id 寻址 main 面板页。
-        // 两者必须成对注册：点击行会 selectPanel(id)，main 里没有对应 key 会抛错。
-        const offPanelList = slots.inject('sidebar.panellist', () =>
-          slots.register({
-            name: 'sidebar.panellist',
-            id: PANEL_NAME,
-            order: 20,
-            locale: SETTINGS_NS,
-            label: PANEL_NAME,
-          }, PanelIcon))
-        const offMain = slots.inject('main', () =>
-          slots.register({
-            name: 'main',
-            key: PANEL_NAME,
-            locale: SETTINGS_NS,
-            inject: () => ({}),
-          }, PanelPage))
+        mount('plugins.bundle.config', () =>
+          slots.inject('plugins.bundle.config', () =>
+            slots.register({
+              name: 'plugins.bundle.config',
+              key: BUNDLE_KEY,
+              locale: SETTINGS_NS,
+              inject: () => ({}),
+            }, Page)))
+        // 侧栏导航行 + 同名 main 面板页必须成对：点击行会 selectPanel(id)。
+        mount('sidebar.panellist', registerPanelRow)
+        mount('main', registerPanelPage)
         return () => {
-          try { if (typeof offRow === 'function') offRow() } catch { /* 已随页面卸载 */ }
-          try { if (typeof offBundle === 'function') offBundle() } catch { /* 已随页面卸载 */ }
-          try { if (typeof offPanelList === 'function') offPanelList() } catch { /* 已随页面卸载 */ }
-          try { if (typeof offMain === 'function') offMain() } catch { /* 已随页面卸载 */ }
+          for (const off of offs) {
+            try { off() } catch { /* 已随页面卸载 */ }
+          }
         }
       })
     }

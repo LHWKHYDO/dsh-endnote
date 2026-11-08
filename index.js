@@ -14,7 +14,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFile, spawn } from 'node:child_process'
-import z from '@deepseek-ai/schemastery'
+import z from './vendor/node_modules/@deepseek-ai/schemastery/lib/index.mjs'
 import { IndexStore, pickIndexFile, preferredIndexFile, resolveConfig, DEFAULT_LIBRARY_PATH } from './lib/index-store.js'
 import { searchEntries } from './lib/search.js'
 

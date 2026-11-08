@@ -1,5 +1,7 @@
 # 依赖
 node_modules/
+# 自带的 schemastery 副本随仓库发布（安装时无需联网拉依赖）
+!vendor/node_modules/
 
 # 本地索引、阅读日志与缓存（含本机绝对路径与文献元数据，勿提交）
 .data/
