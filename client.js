@@ -248,27 +248,34 @@ window.__ModuleLoader__.load({
 
     /**
      * 配置页组件：草稿态 + 保存/放弃，直接走 configForms 的共享控制器。
-     * @param {{ t?: (key: string) => string, scope: any, pickDirectory: () => Promise<string | null> }} props
+     * 官方页面渲染 plugins.row.config 时会传入 `form`（{ state, mutate }，绑定到该行的
+     * 命名空间）——优先用它，避免自己去猜命名空间拿到 unavailable 的 scope。
+     * @param {{ t?: (key: string) => string, scope?: any, form?: any, pickDirectory: () => Promise<string | null> }} props
      */
     function EndnoteSettings(props) {
       const t = typeof props.t === 'function' ? props.t : (key) => key
       const scope = props.scope
+      const official = props.form && props.form.state ? props.form : null
       const pickDirectory = props.pickDirectory
       const pathId = React.useId()
       const limitId = React.useId()
 
       const readSnapshot = () => {
         try {
+          if (official) return official.state
           return scope && typeof scope.getSnapshot === 'function' ? scope.getSnapshot() : null
         } catch {
           return null
         }
       }
-      const [snap, setSnap] = React.useState(readSnapshot)
+      const [snapState, setSnapState] = React.useState(readSnapshot)
+      // 官方 form 的 state 由插件页每次渲染传入（父组件订阅了配置镜像），
+      // 无需再自己订阅；只有走 scope 时才需要 subscribe。
+      const snap = official ? official.state : snapState
       React.useEffect(() => {
-        if (!scope || typeof scope.subscribe !== 'function') return undefined
-        return scope.subscribe(() => setSnap(readSnapshot()))
-      }, [scope])
+        if (official || !scope || typeof scope.subscribe !== 'function') return undefined
+        return scope.subscribe(() => setSnapState(readSnapshot()))
+      }, [scope, official])
 
       const [draft, setDraft] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
@@ -302,6 +309,10 @@ window.__ModuleLoader__.load({
         (lib) => String(lib.path).trim().toLowerCase() === String(working.libraryPath).trim().toLowerCase(),
       )
 
+      /** 提交入口：官方 form 优先，否则走 configForms scope。 */
+      const mutateConfig = (ops, revision) =>
+        official && typeof official.mutate === 'function' ? official.mutate(ops, revision) : scope.mutate(ops, revision)
+
       /** 把一份草稿整体提交（切换 = 改 libraryPath 后立即提交，一键生效）。 */
       const commit = async (next) => {
         if (busy) return
@@ -327,7 +338,7 @@ window.__ModuleLoader__.load({
         setBusy(true)
         setNotice('')
         try {
-          const ok = await scope.mutate(ops, snap && snap.revision)
+          const ok = await mutateConfig(ops, snap && snap.revision)
           if (ok) {
             setDraft(null)
             setNotice(t('saved'))
@@ -714,17 +725,22 @@ window.__ModuleLoader__.load({
       // ns 即 Loader entry id：优先用 describe() 里的实际命名空间，未就绪时按候选回退。
       // 注意 configForms.describe() 返回的是镜像对象（getSnapshot() 才有 view）。
       const pickScope = () => {
+        let namespaces = []
         try {
           const mirror = typeof configForms.describe === 'function' ? configForms.describe() : null
           const mirrorSnap = mirror && typeof mirror.getSnapshot === 'function' ? mirror.getSnapshot() : null
-          const namespaces = mirrorSnap && mirrorSnap.view && mirrorSnap.view.namespaces
-          if (Array.isArray(namespaces)) {
-            const hit = namespaces.find((row) => row && typeof row.ns === 'string' && row.ns.indexOf('endnote') !== -1)
-            if (hit) return configForms.get(hit.ns)
-          }
+          const list = mirrorSnap && mirrorSnap.view && mirrorSnap.view.namespaces
+          if (Array.isArray(list)) namespaces = list
         } catch (error) {
           console.warn('[' + PLUGIN + '] 读取配置命名空间失败', error)
         }
+        // 1) 精确匹配行 entry id（include:dsh-endnote）或包命名空间（dsh-endnote）。
+        const exact = namespaces.find((row) => row && (row.ns === 'include:dsh-endnote' || row.ns === 'dsh-endnote'))
+        if (exact) return configForms.get(exact.ns)
+        // 2) 其它含 endnote 的命名空间。
+        const fuzzy = namespaces.find((row) => row && typeof row.ns === 'string' && row.ns.indexOf('endnote') !== -1)
+        if (fuzzy) return configForms.get(fuzzy.ns)
+        // 3) 镜像还没就绪：按候选 id 逐个试，跳过 unavailable 的那个。
         for (const candidate of ['include:dsh-endnote', 'dsh-endnote']) {
           try {
             const candidateScope = configForms.get(candidate)
@@ -765,11 +781,14 @@ window.__ModuleLoader__.load({
       const PanelPage = (slotProps) => {
         const h = React.createElement
         const t = typeof slotProps.t === 'function' ? slotProps.t : (key) => key
+        // 命名空间可能在本页打开后才就绪（插件从缺失恢复、行重建），
+        // 每次渲染重新解析 scope，避免抓住注册时那个 unavailable 的旧 scope。
+        const liveScope = pickScope() || scope
         return h('div', { className: 'dshEndnoteCfg_panel' },
           h('div', { className: 'dshEndnoteCfg_pageBody' },
             h('h2', { className: 'dshEndnoteCfg_heading' }, PANEL_NAME),
             h(EndnoteDashboard, { t }),
-            h(EndnoteSettings, Object.assign({}, slotProps, { t, scope, pickDirectory })),
+            h(EndnoteSettings, Object.assign({}, slotProps, { t, scope: liveScope, pickDirectory })),
           ),
         )
       }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-endnote",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "EndNote-first literature research for DeepSeek Harness: search your local EndNote library, then open the matching PDF in the sidebar.",
   "type": "module",
   "license": "MIT",

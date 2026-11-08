@@ -29,6 +29,11 @@ function fakeCtx(options = {}) {
       if (name === 'configEditor') return options.configEditor
       return undefined
     },
+    // 宿主用 ctx.inject 等 webServer/connection 就绪；本测试没有这两个服务，
+    // 回调立刻执行，路由注册被跳过（工具部分不受影响）。
+    inject(_deps, callback) {
+      callback(ctx)
+    },
     effect(fn) {
       const disposer = fn()
       disposers.push(disposer)

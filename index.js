@@ -571,15 +571,15 @@ export function apply(ctx, rawConfig) {
           const out = preferredIndexFile(config)
           fs.mkdirSync(config.dataDir, { recursive: true })
           const script = path.join(packageDir, 'scripts', 'endnote_index.py')
-          const output = await runPython(config.pythonPath, [script, '--lib', config.libraryPath, '--out', out])
+          const run = await runPython(config.pythonPath, [script, '--lib', config.libraryPath, '--out', out])
           store.invalidate()
-          const built = fs.existsSync(out) ? new IndexStore({ ...config, indexFile: out }).load() : null
+          const built = run.ok && fs.existsSync(out) ? new IndexStore({ ...config, indexFile: out }).load() : null
           return {
             ok: Boolean(built && built.entries.length),
             indexFile: out,
             entries: built ? built.entries.length : 0,
             withPdf: built ? built.entries.filter((entry) => entry.files.some((file) => file.exists)).length : 0,
-            output,
+            output: run.output,
           }
         },
       }),
@@ -684,18 +684,21 @@ export function apply(ctx, rawConfig) {
 
   // ------------------------------------------------------------------
   // 侧栏面板数据 + 打开文件夹：webServer 同源路由（官方 open-in-app 同款）。
-  // webServer / connection 任一缺失时只降级这两条路由，工具不受影响。
+  // 用 ctx.inject 等待 webServer/connection 就绪后再注册：启动早期 apply 时这两个服务
+  // 可能还没出现，直接 ctx.get 会拿到 undefined 而静默跳过注册（面板随后 HTTP 404）。
   // ------------------------------------------------------------------
-  const webServer = ctx.get('webServer')
-  const connection = ctx.get('connection')
-  if (
-    !webServer || typeof webServer.register !== 'function' ||
-    !connection || typeof connection.requestRejection !== 'function'
-  ) {
-    console.warn('[dsh-endnote] 缺少 webServer/connection 服务：侧栏面板数据与「打开文件夹」未注册（检索等工具不受影响）')
-  } else {
+  ctx.inject(['webServer', 'connection'], (webCtx) => {
+    const webServer = webCtx.get('webServer')
+    const connection = webCtx.get('connection')
+    if (
+      !webServer || typeof webServer.register !== 'function' ||
+      !connection || typeof connection.requestRejection !== 'function'
+    ) {
+      console.warn('[dsh-endnote] 缺少 webServer/connection 服务：侧栏面板数据与「打开文件夹」未注册（检索等工具不受影响）')
+      return
+    }
     // 面板数据：?recent=N（最近阅读条数）&added=N（最近导入条数，0=不返回）。
-    ctx.effect(() => webServer.register({
+    webCtx.effect(() => webServer.register({
       kind: 'exact',
       path: PANEL_DATA_PATH,
       handler: async (req, res) => {
@@ -714,7 +717,7 @@ export function apply(ctx, rawConfig) {
     }), `dsh-endnote: GET ${PANEL_DATA_PATH}`)
 
     // 打开文件夹：POST {path}，绝对路径 + 确实是目录才执行。
-    ctx.effect(() => webServer.register({
+    webCtx.effect(() => webServer.register({
       kind: 'exact',
       path: OPEN_FOLDER_PATH,
       handler: async (req, res) => {
@@ -749,7 +752,7 @@ export function apply(ctx, rawConfig) {
         }
       },
     }), `dsh-endnote: POST ${OPEN_FOLDER_PATH}`)
-  }
+  })
 
   const systemPrompt = ctx.get('systemPrompt')
   if (systemPrompt && typeof systemPrompt.section === 'function') {
@@ -779,15 +782,15 @@ export function apply(ctx, rawConfig) {
  * 执行 Python 索引脚本，收集输出与错误。
  * @param {string} python
  * @param {string[]} args
- * @returns {Promise<string>}
+ * @returns {Promise<{ ok: boolean, output: string }>}
  */
 function runPython(python, args) {
   return new Promise((resolve) => {
     const env = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
     execFile(python, args, { windowsHide: true, env, timeout: 300_000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
       const combined = [stdout, stderr].filter(Boolean).join('\n').trim()
-      if (error && !combined) resolve(`${error.message}`)
-      else resolve(combined)
+      if (error && !combined) resolve({ ok: false, output: `${error.message}` })
+      else resolve({ ok: !error, output: combined })
     })
   })
 }
