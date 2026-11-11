@@ -17,6 +17,8 @@ import { execFile, spawn } from 'node:child_process'
 import z from './vendor/node_modules/@deepseek-ai/schemastery/lib/index.mjs'
 import { IndexStore, pickIndexFile, preferredIndexFile, resolveConfig, DEFAULT_LIBRARY_PATH } from './lib/index-store.js'
 import { searchEntries } from './lib/search.js'
+import { readAnnotations, writeAnnotations } from './lib/annotations.js'
+import { exportAnnotatedPdf } from './lib/pdf-export.js'
 
 export const name = 'dsh-endnote'
 
@@ -48,6 +50,27 @@ const PANEL_DATA_PATH = '/dsh-endnote/panel-data'
 const OPEN_FOLDER_PATH = '/dsh-endnote/open-folder'
 /** JSON 请求体上限（与官方 open-in-app 一致）。 */
 const MAX_BODY_BYTES = 64 * 1024
+/** 标注侧车请求体上限：2000 条标注留足余量。 */
+const MAX_ANNOTATION_BODY_BYTES = 8 * 1024 * 1024
+/** PDF 标注侧车读写路由（读 GET ?path=，写 POST {path, annotations}）。 */
+const PDF_ANNOTATION_PATH = '/dsh-endnote/pdf-annotations'
+/** 内置 PDF.js 静态资源前缀（客户端半边按需 import）。 */
+const PDFJS_PREFIX = '/dsh-endnote/vendor/pdfjs'
+/** 导出带原生注释的 PDF 副本（只写插件 dataDir）。 */
+const EXPORT_PDF_PATH = '/dsh-endnote/export-pdf'
+/** 内置 PDF.js 资源根目录。 */
+const PDFJS_ROOT = path.join(packageDir, 'vendor', 'pdfjs')
+/** 允许静态下发的扩展名与对应 Content-Type（其余一律 404，不放行任意文件）。 */
+const PDFJS_TYPES = {
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.wasm': 'application/wasm',
+  '.bcmap': 'application/octet-stream',
+  '.ttf': 'font/ttf',
+  '.pfb': 'application/octet-stream',
+  '.txt': 'text/plain; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+}
 
 const TEXT = {
   search: '检索本地 EndNote 文献库（严格只读）。多关键词为 AND 关系，命中范围覆盖标题、作者、年份、期刊、关键词、DOI、类型、分组、附件路径与摘要前 800 字；可用 read 参数按 EndNote 已读(read)/未读(unread)状态过滤，结果会标注每条的已读状态与评分。当用户要查文献、找论文、了解某主题的既有研究时，先调用本工具而不是联网搜索。结果里的 path 是本地 PDF 绝对路径，可直接交给 endnote_open 在右侧栏打开。0 命中时走补救链：先联网检索该关键词拿到规范的完整标题/作者/DOI，再用这些字段回查本工具做二次关联；仍无结果或候选有歧义时，向用户列出候选并询问是哪一篇。',
@@ -752,6 +775,187 @@ export function apply(ctx, rawConfig) {
         }
       },
     }), `dsh-endnote: POST ${OPEN_FOLDER_PATH}`)
+
+    // ------------------------------------------------------------------
+    // PDF 标注侧车：GET 读取 / POST 保存。
+    // 只写插件 dataDir，绝不碰 EndNote 库；坐标是页面归一化的 0..1。
+    // ------------------------------------------------------------------
+    webCtx.effect(() => webServer.register({
+      kind: 'exact',
+      path: PDF_ANNOTATION_PATH,
+      handler: async (req, res) => {
+        try {
+          const rejection = connection.requestRejection(req)
+          if (rejection !== undefined) { res.statusCode = rejection; res.end(); return }
+          if (req.method === 'GET') {
+            const url = new URL(String(req.url || PDF_ANNOTATION_PATH), 'http://127.0.0.1')
+            const target = url.searchParams.get('path')
+            if (typeof target !== 'string' || !path.isAbsolute(target)) {
+              sendJson(res, 400, { ok: false, error: 'path must be an absolute string' })
+              return
+            }
+            const loaded = readAnnotations(config.dataDir, target)
+            sendJson(res, 200, { ok: true, path: target, ...loaded })
+            return
+          }
+          if (req.method !== 'POST') {
+            res.statusCode = 405
+            res.setHeader('allow', 'GET, POST')
+            res.end()
+            return
+          }
+          const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase()
+          if (contentType !== 'application/json') {
+            sendJson(res, 415, { ok: false, error: 'content-type must be application/json' })
+            return
+          }
+          const body = await readBoundedBody(req, MAX_ANNOTATION_BODY_BYTES)
+          if (body === null) { sendJson(res, 413, { ok: false, error: 'body too large' }); return }
+          let parsed = null
+          try {
+            parsed = JSON.parse(body)
+          } catch {
+            sendJson(res, 400, { ok: false, error: 'invalid JSON' })
+            return
+          }
+          const target = parsed && parsed.path
+          if (typeof target !== 'string' || !path.isAbsolute(target)) {
+            sendJson(res, 400, { ok: false, error: 'path must be an absolute string' })
+            return
+          }
+          if (path.extname(target).toLowerCase() !== '.pdf') {
+            sendJson(res, 400, { ok: false, error: 'path must point to a .pdf file' })
+            return
+          }
+          if (!Array.isArray(parsed.annotations)) {
+            sendJson(res, 400, { ok: false, error: 'annotations must be an array' })
+            return
+          }
+          try {
+            const stat = await fs.promises.stat(target)
+            if (!stat.isFile()) { sendJson(res, 400, { ok: false, error: 'path is not a file' }); return }
+          } catch {
+            sendJson(res, 404, { ok: false, error: 'PDF does not exist' })
+            return
+          }
+          const saved = writeAnnotations(config.dataDir, target, parsed.annotations)
+          sendJson(res, 200, { ok: true, path: target, count: saved.annotations.length, updatedAt: saved.updatedAt, pdfStamp: saved.pdfStamp })
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    }), `dsh-endnote: ${PDF_ANNOTATION_PATH}`)
+
+    // 导出带原生注释的副本：读原件 → 写副本 → 只落到插件 dataDir/exports。
+    webCtx.effect(() => webServer.register({
+      kind: 'exact',
+      path: EXPORT_PDF_PATH,
+      handler: async (req, res) => {
+        try {
+          const rejection = connection.requestRejection(req)
+          if (rejection !== undefined) { res.statusCode = rejection; res.end(); return }
+          if (req.method !== 'POST') {
+            res.statusCode = 405
+            res.setHeader('allow', 'POST')
+            res.end()
+            return
+          }
+          const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase()
+          if (contentType !== 'application/json') {
+            sendJson(res, 415, { ok: false, error: 'content-type must be application/json' })
+            return
+          }
+          const body = await readBoundedBody(req, MAX_ANNOTATION_BODY_BYTES)
+          if (body === null) { sendJson(res, 413, { ok: false, error: 'body too large' }); return }
+          let parsed = null
+          try {
+            parsed = JSON.parse(body)
+          } catch {
+            sendJson(res, 400, { ok: false, error: 'invalid JSON' })
+            return
+          }
+          const target = parsed && parsed.path
+          if (typeof target !== 'string' || !path.isAbsolute(target) || path.extname(target).toLowerCase() !== '.pdf') {
+            sendJson(res, 400, { ok: false, error: 'path must be an absolute .pdf path' })
+            return
+          }
+          if (!Array.isArray(parsed.annotations)) {
+            sendJson(res, 400, { ok: false, error: 'annotations must be an array' })
+            return
+          }
+          try {
+            const stat = await fs.promises.stat(target)
+            if (!stat.isFile()) { sendJson(res, 400, { ok: false, error: 'path is not a file' }); return }
+          } catch {
+            sendJson(res, 404, { ok: false, error: 'PDF does not exist' })
+            return
+          }
+          const result = await exportAnnotatedPdf(target, parsed.annotations, path.join(config.dataDir, 'exports'))
+          sendJson(res, 200, { ok: true, path: target, ...result })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          sendJson(res, 500, { ok: false, error: message })
+        }
+      },
+    }), `dsh-endnote: POST ${EXPORT_PDF_PATH}`)
+
+    // ------------------------------------------------------------------
+    // 内置 PDF.js 静态资源：客户端编辑器按需 import / new Worker。
+    // 只放行白名单扩展名，路径规范化后必须落在 vendor/pdfjs 内。
+    // ------------------------------------------------------------------
+    let pdfjsReady = false
+    try {
+      pdfjsReady = fs.statSync(PDFJS_ROOT).isDirectory()
+    } catch {
+      pdfjsReady = false
+    }
+    if (!pdfjsReady) {
+      console.warn('[dsh-endnote] 缺少 vendor/pdfjs：PDF 编辑器不可用（打开与检索不受影响）')
+    } else {
+      webCtx.effect(() => webServer.register({
+        kind: 'prefix',
+        path: PDFJS_PREFIX,
+        handler: async (req, res) => {
+          try {
+            const rejection = connection.requestRejection(req)
+            if (rejection !== undefined) { res.statusCode = rejection; res.end(); return }
+            if (req.method !== 'GET' && req.method !== 'HEAD') {
+              res.statusCode = 405
+              res.setHeader('allow', 'GET, HEAD')
+              res.end()
+              return
+            }
+            const url = new URL(String(req.url || PDFJS_PREFIX), 'http://127.0.0.1')
+            let rel = ''
+            try {
+              rel = decodeURIComponent(url.pathname.slice(PDFJS_PREFIX.length))
+            } catch {
+              res.statusCode = 400
+              res.end()
+              return
+            }
+            if (!rel || rel.endsWith('/')) { res.statusCode = 404; res.end(); return }
+            const file = path.resolve(PDFJS_ROOT, '.' + rel)
+            if (!file.startsWith(PDFJS_ROOT + path.sep)) { res.statusCode = 403; res.end(); return }
+            const type = PDFJS_TYPES[path.extname(file).toLowerCase()]
+            if (!type) { res.statusCode = 404; res.end(); return }
+            const stat = await fs.promises.stat(file).catch(() => null)
+            if (stat === null || !stat.isFile()) { res.statusCode = 404; res.end(); return }
+            res.statusCode = 200
+            res.setHeader('content-type', type)
+            res.setHeader('content-length', String(stat.size))
+            res.setHeader('cache-control', 'no-cache')
+            if (req.method === 'HEAD') { res.end(); return }
+            const stream = fs.createReadStream(file)
+            stream.on('error', () => { try { res.destroy() } catch { /* 已断开 */ } })
+            stream.pipe(res)
+          } catch (error) {
+            res.statusCode = 500
+            res.end(error instanceof Error ? error.message : String(error))
+          }
+        },
+      }), `dsh-endnote: GET ${PDFJS_PREFIX}/*`)
+    }
   })
 
   const systemPrompt = ctx.get('systemPrompt')

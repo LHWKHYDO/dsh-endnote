@@ -1,7 +1,7 @@
 {
   "name": "dsh-endnote",
-  "version": "0.1.2",
-  "description": "EndNote-first literature research for DeepSeek Harness: search your local EndNote library, then open the matching PDF in the sidebar.",
+  "version": "0.2.0",
+  "description": "EndNote-first literature research for DeepSeek Harness: search your local EndNote library, open the matching PDF in the sidebar, and highlight or box-annotate it in place.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -10,7 +10,9 @@
     "dsh",
     "endnote",
     "literature",
-    "pdf"
+    "pdf",
+    "annotations",
+    "highlight"
   ],
   "exports": {
     ".": "./index.js",
@@ -48,6 +50,7 @@
       "immediately": true,
       "inject": [
         "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-sidebar-documentpreview",
         "@deepseek-ai/dsh-api-session-controller",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-plugin-manager",
