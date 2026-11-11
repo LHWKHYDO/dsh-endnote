@@ -134,6 +134,67 @@ test('标注 POST 保存后 GET 能读回，且只写插件数据目录', async 
   assert.ok(libFiles.every((entry) => !String(entry).endsWith('.json')))
 })
 
+test('PDF 字节路由支持整包与 Range 分段', async () => {
+  const { pdf, of } = boot()
+  const handler = of('/dsh-endnote/pdf-bytes').handler
+  const withRange = (url, range) => {
+    const request = makeRequest('GET', url)
+    request.headers = { range }
+    return request
+  }
+
+  // 整包：编辑器拿不到宿主 bytes 时的主路径。
+  const full = makeResponse()
+  await handler(makeRequest('GET', '/dsh-endnote/pdf-bytes?path=' + encodeURIComponent(pdf)), full)
+  await full.done
+  assert.equal(full.statusCode, 200)
+  assert.equal(full.headers['content-type'], 'application/pdf')
+  assert.equal(full.headers['accept-ranges'], 'bytes')
+  assert.equal(full.headers['content-length'], '8')
+  assert.equal(full.body, '%PDF-1.4')
+
+  // Range：pdf.js 会先要一小段。
+  const ranged = makeResponse()
+  await handler(withRange('/dsh-endnote/pdf-bytes?path=' + encodeURIComponent(pdf), 'bytes=2-4'), ranged)
+  await ranged.done
+  assert.equal(ranged.statusCode, 206)
+  assert.equal(ranged.headers['content-range'], 'bytes 2-4/8')
+  assert.equal(ranged.body, 'DF-')
+
+  // 末尾区间（bytes=-3）与越界区间。
+  const tail = makeResponse()
+  await handler(withRange('/dsh-endnote/pdf-bytes?path=' + encodeURIComponent(pdf), 'bytes=-3'), tail)
+  await tail.done
+  assert.equal(tail.statusCode, 206)
+  assert.equal(tail.body, '1.4')
+
+  const overflow = makeResponse()
+  await handler(withRange('/dsh-endnote/pdf-bytes?path=' + encodeURIComponent(pdf), 'bytes=99-120'), overflow)
+  assert.equal(overflow.statusCode, 416)
+
+  const head = makeResponse()
+  await handler(makeRequest('HEAD', '/dsh-endnote/pdf-bytes?path=' + encodeURIComponent(pdf)), head)
+  assert.equal(head.statusCode, 200)
+  assert.equal(head.headers['content-length'], '8')
+
+  // 只读、只放行绝对 .pdf 路径。
+  const relative = makeResponse()
+  await handler(makeRequest('GET', '/dsh-endnote/pdf-bytes?path=paper.pdf'), relative)
+  assert.equal(relative.statusCode, 400)
+
+  const notPdf = makeResponse()
+  await handler(makeRequest('GET', '/dsh-endnote/pdf-bytes?path=' + encodeURIComponent(path.join(os.tmpdir(), 'x.txt'))), notPdf)
+  assert.equal(notPdf.statusCode, 400)
+
+  const missing = makeResponse()
+  await handler(makeRequest('GET', '/dsh-endnote/pdf-bytes?path=' + encodeURIComponent(path.join(os.tmpdir(), 'nope.pdf'))), missing)
+  assert.equal(missing.statusCode, 404)
+
+  const method = makeResponse()
+  await handler(makeRequest('POST', '/dsh-endnote/pdf-bytes?path=' + encodeURIComponent(pdf)), method)
+  assert.equal(method.statusCode, 405)
+})
+
 test('标注路由拒绝非法输入', async () => {
   const { of } = boot()
   const handler = of('/dsh-endnote/pdf-annotations').handler

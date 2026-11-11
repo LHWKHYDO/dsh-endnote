@@ -7,7 +7,7 @@ A literature-research plugin for [DeepSeek Harness](https://github.com/deepseek-
 - **Read-only**: the EndNote library is never written to; index artifacts stay inside the plugin's own data directory.
 - **Local first, web second**: the injected system prompt requires `endnote_search` before any web search. Only on a local miss does the model look up the canonical title/DOI online, re-query the library with those fields, and finally list web candidates if still unmatched.
 - **Open what you found**: `endnote_open` verifies the PDF exists and hands it to the host PDF viewer — only for results opened in the current session.
-- **Sidebar panel**: library overview with totals, recent reads / recently added (choose count, or one/both lists), and one-click refresh; titles and folders are links that open your file manager.
+- **Sidebar panel**: library overview with totals, recent reads / recently added (choose count, or one/both lists), and one-click refresh; a title opens that PDF in the sidebar, a folder opens your file manager.
 
 ## How it works
 
@@ -84,11 +84,19 @@ Configuration lives in the plugin entry's `config` (`cordis.patch.yml`); the gra
 The `dsh-endnote` panel page starts with a dashboard and the settings form below it:
 
 - **Totals**: total entries / with PDF / read / unread / unmarked / rated / groups + index timestamp.
-- **Recent reads**: count 5/10/20/50; each row shows title, read state, rating and last-read time; title and folder are links that open the containing folder in your file manager.
+- **Recent reads**: count 5/10/20/50; each row shows title, read state, rating and last-read time; clicking a title reopens that PDF in the sidebar (so a closed tab can be restored from here), and clicking the folder path opens the containing folder in your file manager.
 - **Recently added**: the **Show** dropdown selects *Recent reads / Recently added / Both*, ordered by EndNote import time.
+- **New-tab entry**: the sidebar's “+ New tab” guide has an *EndNote Recent Reads* page — click it to list recently read papers without opening any PDF first; a title opens it in the EndNote PDF tab. A same-named card also appears on the Start page and in the “More tools” menu.
 - **Refresh**: re-fetch the displayed data (read log and read-state changes appear right away; newly imported papers need an `endnote_rebuild` to enter the totals).
+- **Sidebar entry**: the page top shows the sidebar-entry state; when registered you can open the panel, and when missing (client half loaded later than the page) you can pin it to the sidebar or reload the page. Once registered, the entry persists across restarts.
 
-Data flows over two same-origin routes, `GET /dsh-endnote/panel-data` and `POST /dsh-endnote/open-folder`, registered the same way as the official open-in-app: every request passes the host `connection` Host/Origin fence, and folder opening only accepts absolute paths to real directories. If `webServer` / `connection` is missing the routes degrade silently; the six tools are unaffected.
+Data flows over same-origin routes — `GET /dsh-endnote/panel-data`, `POST /dsh-endnote/open-folder`, `GET|HEAD /dsh-endnote/pdf-bytes?path=<absolute>` (Range-capable; the editor pulls PDF bytes itself instead of waiting for the host to inject them), `GET|POST /dsh-endnote/pdf-annotations`, `POST /dsh-endnote/export-pdf` and `GET /dsh-endnote/vendor/pdfjs/*` — registered the same way as the official open-in-app: every request passes the host `connection` Host/Origin fence, folder opening only accepts absolute paths to real directories, and the byte/annotation routes only accept absolute `.pdf` paths. If `webServer` / `connection` is missing the routes degrade silently; the six tools are unaffected.
+
+## PDF editor
+
+- **Colour picker**: toolbar / selection floater / context menu / settings share one swatch component — an inline “current colour square” that opens a popup with 7 common quick colours plus the native picker; it closes when you click outside. The three settings rows (highlight / box / note text) use the same aligned style.
+- **Buttons**: Save and Export are icon buttons with hover tooltips; the clock icon toggles the saved-status / annotation-count display (the settings panel can also toggle the saved hint separately).
+- **Canvas**: with the default tool the blank area is a grab hand (drag to pan) and turns into text selection over text — drag-select to highlight; hold Space to force the hand.
 
 ## Index
 

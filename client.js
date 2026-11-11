@@ -20,6 +20,12 @@ window.__ModuleLoader__.load({
     // 与主机半边 index.js 对齐的同源路由（document-relative，官方 open-in-app 同款）。
     const PANEL_DATA_PATH = '/dsh-endnote/panel-data'
     const OPEN_FOLDER_PATH = '/dsh-endnote/open-folder'
+    // PDF 原始字节（支持 Range）：编辑器自己按需拉取，不依赖宿主整包注入。
+    const PDF_BYTES_PATH = '/dsh-endnote/pdf-bytes'
+    // 右侧栏「最近阅读」回调：由 apply() 在拿到 sidebarRight 时设置。
+    let openRecentPdf = null
+    // 面板里点条目直接在右侧栏打开 PDF（同样是 apply() 时赋值）。
+    let openPdfInSidebar = null
 
     const SETTINGS_TEXT = {
       en: {
@@ -28,7 +34,6 @@ window.__ModuleLoader__.load({
         libraryPathHint: 'Read-only — chosen via "Switch" in the list below; search and open use this library.',
         notInList: 'The active library is not in the list — add it below to switch back easily.',
         emptyPath: 'No library selected — add your first EndNote library below, then click "Switch".',
-        browse: 'Browse…',
         libs: 'Saved libraries',
         libsHint: 'The first entry is the primary library; "Switch" applies in one click.',
         addLib: 'Add',
@@ -72,7 +77,8 @@ window.__ModuleLoader__.load({
         readBadge: 'Read ✓',
         unreadBadge: 'Unread ○',
         unknownBadge: 'Unmarked ·',
-        dashHint: 'Click a title or a folder to open it in the system file manager.',
+        dashHint: 'Click a title to open the PDF in the sidebar; click a folder to open it in the file manager.',
+        openInSidebar: 'Open in sidebar',
         dashEmpty: 'No reading records yet — open a PDF once with endnote_open.',
         dashAddedEmpty: 'The index has no added-at timestamps.',
         dashLoadFailed: 'Failed to load panel data.',
@@ -91,7 +97,6 @@ window.__ModuleLoader__.load({
         libraryPathHint: '只读展示；由下方清单的「切换」决定，检索与打开使用该库。',
         notInList: '当前库不在清单中——在下方添加后即可一键切换回来。',
         emptyPath: '尚未选择库——请在下方添加第一个 EndNote 库，再点「切换」。',
-        browse: '浏览…',
         libs: '已存库列表',
         libsHint: '第 1 个为主库；「切换」一键生效。',
         addLib: '添加',
@@ -135,7 +140,8 @@ window.__ModuleLoader__.load({
         readBadge: '已读✓',
         unreadBadge: '未读○',
         unknownBadge: '未标·',
-        dashHint: '点击标题或文件夹可在系统文件管理器中打开。',
+        dashHint: '点击标题在右侧栏打开 PDF；点击文件夹路径在系统文件管理器中打开。',
+        openInSidebar: '在右侧栏打开',
         dashEmpty: '还没有阅读记录——用 endnote_open 打开一次 PDF 即可。',
         dashAddedEmpty: '索引里没有入库时间。',
         dashLoadFailed: '面板数据加载失败。',
@@ -155,7 +161,6 @@ window.__ModuleLoader__.load({
       '.dshEndnoteCfg_intro{margin:0;font-size:13px;line-height:18px;color:var(--dsw-alias-label-tertiary)}',
       '.dshEndnoteCfg_field{display:flex;flex-direction:column;gap:6px}',
       '.dshEndnoteCfg_label{font-size:13px;font-weight:500;color:var(--dsw-alias-label-secondary)}',
-      '.dshEndnoteCfg_inputRow{display:flex;gap:8px;align-items:center}',
       '.dshEndnoteCfg_input{flex:1;min-width:0;box-sizing:border-box;height:30px;padding:0 10px;border-radius:var(--dsw-radius-sm);border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px}',
       '.dshEndnoteCfg_input:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}',
       '.dshEndnoteCfg_input[aria-invalid="true"]{border-color:var(--dsw-alias-state-warn-secondary)}',
@@ -631,9 +636,12 @@ window.__ModuleLoader__.load({
           h('button', {
             className: 'dshEndnoteCfg_linkBtn',
             type: 'button',
-            title: t('dashHint'),
-            disabled: !item.folder,
-            onClick: () => openFolder(item.folder),
+            title: item.path ? t('openInSidebar') : t('dashHint'),
+            disabled: !item.path && !item.folder,
+            onClick: () => {
+              if (item.path && openPdfInSidebar) { openPdfInSidebar(item.path); return }
+              openFolder(item.folder)
+            },
           }, item.year ? `${item.title} (${item.year})` : item.title),
           h('span', { className: 'dshEndnoteCfg_rowMeta' }, [
             readBadge(item.read),
@@ -778,7 +786,7 @@ window.__ModuleLoader__.load({
         return
       }
 
-      ctx.effect(() => locale.register(SETTINGS_NS, SETTINGS_TEXT))
+      ctx.effect(() => registerLocaleSafe(locale, SETTINGS_NS, SETTINGS_TEXT))
 
       const pickDirectory = async () => {
         const workspace = get('uiWorkspace')
@@ -950,19 +958,25 @@ window.__ModuleLoader__.load({
     const PDF_EDITOR_ID = 'dsh-endnote/pdf'
     const PDF_NS = 'dsh-endnote.pdf'
     const PDF_VENDOR = '/dsh-endnote/vendor/pdfjs/'
+    // 「最近阅读」独立标签页：注册进宿主 sidebarRightTabs 后，会出现在
+    // 右侧栏「+新标签页」导航里，点击即列出最近阅读的文献。
+    const RECENT_PAGE_ID = 'dsh-endnote/recent'
+    const RECENT_PAGE_KIND = 'dsh-endnote-recent'
     const PDF_API = '/dsh-endnote/pdf-annotations'
     const PDF_EXPORT = '/dsh-endnote/export-pdf'
     // 高亮默认浅绿，方框默认红；两者都能在设置里改。
-    // 预设颜色：绿、红，第 3 个取色器（彩色）。
-    const PDF_PRESET_COLORS = ['#8ce99a', '#e03131']
+    // 常用默认色板（7 色，弹层快捷色直接使用）：取色模块共用。
+    const PDF_COMMON_COLORS = [
+      '#8ce99a', '#e03131', '#ff922b', '#fcc419', '#74c0fc', '#4dabf7', '#845ef7',
+    ]
     const PDF_DEFAULT_HIGHLIGHT = '#8ce99a'
     const PDF_BOX_RED = '#e03131'
 
     const PDF_TEXT = {
       zh: {
-        title: 'EndNote PDF（可标注）',
         loading: '正在载入 PDF…',
         openFailed: '无法打开 PDF：',
+        openTimeout: 'PDF 载入超时（20 秒），请检查来源：',
         pages: '页',
         fit: '适应宽度',
         zoomIn: '放大',
@@ -988,7 +1002,6 @@ window.__ModuleLoader__.load({
         noPath: '无法从资源地址解析 PDF 路径，标注不可用。',
         empty: '选择文字后点「高亮」，或用「方框」在页面上拖出标注框。',
         notePlaceholder: '在此输入标注…',
-        noteDone: '完成',
         cleared: '已删除标注',
         hint: '提示：拖选文字后点颜色即高亮；右键可直接高亮或删除已有标注；「高亮」工具拖选即落色。方框默认红色细边，画完可在框内输入，选中后拖动可移动、拉角可缩放。按住空格变抓手拖动画布；Ctrl+F 查找，Ctrl+滚轮缩放，「导出 PDF」写成原生注释。',
         prevPage: '上一页',
@@ -1008,9 +1021,9 @@ window.__ModuleLoader__.load({
         sizeSmall: '小',
         sizeNormal: '标准',
         sizeLarge: '大',
-        customColor: '自定义',
         noteColorLabel: '标注文字颜色',
         showSavedLabel: '显示已保存提示',
+        statusToggle: '保存时间/注释数量',
         boxFillLabel: '方框填充',
         fillNone: '无',
         fillLight: '淡',
@@ -1022,12 +1035,15 @@ window.__ModuleLoader__.load({
         findPrev: '上一个',
         findNone: '无匹配',
         findIndexing: '正在索引文本…',
-        findCount: '匹配',
+        recentReadTitle: '最近阅读',
+        recentReadNone: '暂无最近阅读记录',
+        recentReadLoadFailed: '加载最近阅读失败',
+        openInSidebar: '在右侧栏打开',
       },
       en: {
-        title: 'EndNote PDF (annotatable)',
         loading: 'Loading PDF…',
         openFailed: 'Cannot open PDF: ',
+        openTimeout: 'PDF load timed out after 20s — source: ',
         pages: 'pages',
         fit: 'Fit width',
         zoomIn: 'Zoom in',
@@ -1053,7 +1069,6 @@ window.__ModuleLoader__.load({
         noPath: 'The PDF path could not be resolved from the resource address; annotations are unavailable.',
         empty: 'Select text and click Highlight, or use Box and drag on the page.',
         notePlaceholder: 'Type a note…',
-        noteDone: 'Done',
         cleared: 'Annotation removed',
         hint: 'Tip: drag-select text then pick a colour, or right-click to highlight or remove an annotation. With the Highlight tool, releasing the drag highlights immediately. Boxes are thin red by default: type inside, drag to move, pull a corner to resize. Hold Space to pan. Ctrl+F to find, Ctrl+wheel to zoom.',
         prevPage: 'Previous page',
@@ -1073,9 +1088,9 @@ window.__ModuleLoader__.load({
         sizeSmall: 'S',
         sizeNormal: 'M',
         sizeLarge: 'L',
-        customColor: 'Custom',
         noteColorLabel: 'Note text colour',
         showSavedLabel: 'Show saved status',
+        statusToggle: 'Saved time / annotation count',
         boxFillLabel: 'Box fill',
         fillNone: 'None',
         fillLight: 'Light',
@@ -1087,37 +1102,77 @@ window.__ModuleLoader__.load({
         findPrev: 'Previous match',
         findNone: 'No matches',
         findIndexing: 'Indexing text…',
-        findCount: 'matches',
+        recentReadTitle: 'Recent Reads',
+        recentReadNone: 'No recent reads yet',
+        recentReadLoadFailed: 'Failed to load recent reads',
+        openInSidebar: 'Open in sidebar',
       },
     }
 
-    /** 渲染颜色选择器：2 预设色（绿/红）+ 取色器。 */
-    function createColorPicker(current, onChange) {
-      return h('span', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-        PDF_PRESET_COLORS.map((entry) => h('button', {
-          key: 'cp-' + entry,
+    // 弹层快捷色（常用 7 色）。
+    const PDF_QUICK_COLORS = PDF_COMMON_COLORS.slice(0, 7)
+
+    /**
+     * 取色组件：行内只有一个「当前颜色方块」，点一下弹出小面板
+     * （常用 7 色快捷 + 原生取色器），点面板外收起。
+     * 所有取色模块（工具栏/浮条/右键/设置）共用；popAlign='right' 时弹层右对齐。
+     */
+    function ColorSwatchPicker(props) {
+      const h = React.createElement
+      const { current, onChange } = props
+      const dotClass = props.dotClass || 'dshEndnotePdf_dot'
+      const popAlign = props.popAlign || 'left'
+      const [open, setOpen] = React.useState(false)
+      const wrapRef = React.useRef(null)
+      // 点外面收起弹层。
+      React.useEffect(() => {
+        if (!open) return undefined
+        const close = (event) => {
+          if (wrapRef.current && !wrapRef.current.contains(event.target)) setOpen(false)
+        }
+        document.addEventListener('mousedown', close)
+        return () => document.removeEventListener('mousedown', close)
+      }, [open])
+      const pick = (color) => {
+        onChange(color)
+        setOpen(false)
+      }
+      const dot = (color, keyPrefix) => h('button', {
+        key: keyPrefix + color,
+        type: 'button',
+        className: dotClass,
+        title: color,
+        'data-active': current === color,
+        style: { background: color },
+        onClick: () => pick(color),
+      })
+      return h('span', { className: 'dshEndnotePdf_swatchWrap', ref: wrapRef },
+        // 触发键：当前颜色方块（放第一个）；无有效色时退回彩虹底。
+        h('button', {
           type: 'button',
-          className: 'dshEndnotePdf_dot',
-          title: entry,
-          'data-active': current === entry,
-          style: { background: entry },
-          onClick: () => onChange(entry),
-        })),
-        h('label', {
-          className: 'dshEndnotePdf_dot dshEndnotePdf_pickerLabel',
-          title: 'custom',
-          style: {
-            background: 'conic-gradient(red, yellow, lime, aqua, blue, magenta, red)',
-          },
-        },
-          h('input', {
-            type: 'color',
-            className: 'dshEndnotePdf_pickerInput',
-            value: current,
-            onChange: (event) => onChange(event.currentTarget.value),
-          }),
-        ),
+          className: dotClass + ' dshEndnotePdf_square',
+          title: current,
+          'data-open': open ? 'true' : 'false',
+          style: { background: current || 'conic-gradient(red, yellow, lime, aqua, blue, magenta, red)' },
+          onClick: () => setOpen((value) => !value),
+        }),
+        open ? h('span', { className: 'dshEndnotePdf_swatchPop', 'data-align': popAlign },
+          PDF_QUICK_COLORS.map((color) => dot(color, 'qd-')),
+          h('label', { className: 'dshEndnotePdf_swatchCustom', title: 'custom' },
+            h('input', {
+              type: 'color',
+              value: current,
+              onChange: (event) => pick(event.currentTarget.value),
+            }),
+          ),
+        ) : null,
       )
+    }
+
+    /** 渲染颜色选择器（设置面板三行用）：当前色方块 + 弹层快捷色与取色器。 */
+    function createColorPicker(current, onChange) {
+      const h = React.createElement
+      return h(ColorSwatchPicker, { current, onChange })
     }
 
     const PDF_CSS = [
@@ -1133,8 +1188,25 @@ window.__ModuleLoader__.load({
       '.dshEndnotePdf_sep{width:1px;height:16px;background:var(--dsw-alias-border-secondary,#e3e5e8);margin:0 2px;}',
       '.dshEndnotePdf_meta{font-size:12px;color:var(--dsw-alias-text-secondary,#646a73);}',
       '.dshEndnotePdf_dot{width:16px;height:16px;border-radius:50%;border:1px solid rgba(0,0,0,.15);cursor:pointer;padding:0;display:inline-flex;align-items:center;justify-content:center;position:relative;overflow:hidden}',
+      '.dshEndnotePdf_welcome{padding:24px 16px;overflow-y:auto;flex:1;}',
+      '.dshEndnotePdf_welcome h3{margin:0 0 16px;font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary,#1e222b);}',
+      '.dshEndnotePdf_welcome p{font-size:12px;color:var(--dsw-alias-text-secondary,#646a73);margin:8px 0;}',
+      '.dshEndnotePdf_welcome ul{list-style:none;padding:0;margin:0;}',
+      '.dshEndnotePdf_welcome li{padding:10px 12px;border-radius:6px;cursor:pointer;margin-bottom:4px;border:1px solid transparent;}',
+      '.dshEndnotePdf_welcome li:hover{background:var(--dsw-alias-fill-secondary,f5f5f6);border-color:var(--dsw-alias-border-l2,#ddd);}',
+      '.dshEndnotePdf_welcome li:active{background:var(--dsw-alias-fill-tertiary,#eee);}',
+      '.dshEndnotePdf_welcome .dshEndnoteCfg_linkBtn{font-size:13px;font-weight:500;color:var(--dsw-alias-brand,#426eff);text-decoration:none;display:block;margin-bottom:2px;}',
+      '.dshEndnotePdf_welcome .dshEndnoteCfg_linkBtn:hover{text-decoration:underline;}',
+      '.dshEndnotePdf_welcome .dshEndnoteCfg_rowPath{font-size:11px;color:var(--dsw-alias-text-tertiary,#969ca6);display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.dshEndnotePdf_dot[data-active=true]{outline:2px solid var(--dsw-alias-border-selected,#3b82f6);outline-offset:1px;}',
-      '.dshEndnotePdf_pickerLabel{cursor:pointer;}',
+      '.dshEndnotePdf_swatchWrap{position:relative;display:inline-flex;align-items:center;}',
+      '.dshEndnotePdf_square{border-radius:4px;}',
+      '.dshEndnotePdf_square[data-open=true]{box-shadow:0 0 0 2px var(--dsw-alias-border-selected,#3b82f6);}',
+      '.dshEndnotePdf_swatchWrap{position:relative;display:inline-flex;align-items:center;}',
+      '.dshEndnotePdf_swatchPop{position:absolute;top:calc(100% + 6px);left:0;z-index:40;display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 10px;width:188px;background:var(--dsw-alias-bg-primary,#fff);border:1px solid var(--dsw-alias-border-secondary,#e3e5e8);border-radius:8px;box-shadow:0 6px 18px rgba(15,23,42,.18);}',
+      '.dshEndnotePdf_swatchPop[data-align="right"]{left:auto;right:0;}',
+      '.dshEndnotePdf_swatchCustom{display:inline-flex;align-items:center;gap:4px;cursor:pointer;}',
+      '.dshEndnotePdf_swatchCustom input{width:22px;height:22px;padding:0;border:none;background:none;cursor:pointer;}',
       '.dshEndnotePdf_pickerLabel .dshEndnotePdf_pickerInput{position:absolute;width:20px;height:20px;opacity:0;cursor:pointer;top:0;left:0;}',
       '.dshEndnotePdf_settingCheck{display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;color:var(--dsw-alias-label-primary)}',
       '.dshEndnotePdf_scroll{flex:1 1 auto;min-height:0;overflow:auto;padding:16px 16px 40px;}',
@@ -1150,6 +1222,10 @@ window.__ModuleLoader__.load({
       '.dshEndnotePdf_hl{position:absolute;border-radius:1px;mix-blend-mode:multiply;pointer-events:none;}',
       '.dshEndnotePdf_line{position:absolute;height:0;pointer-events:none;}',
       '.dshEndnotePdf_page[data-tool="rect"],.dshEndnotePdf_page[data-tool="text"]{cursor:crosshair;}',
+      // 空区抓手：鼠标在画布空白区自动变抓手，拖拽平移画布；在文字上自动变文字指针。
+      '.dshEndnotePdf_page[data-tool="select"]{cursor:grab;}',
+      '.dshEndnotePdf_page[data-tool="select"][data-panning="true"]{cursor:grabbing;}',
+      '.dshEndnotePdf_page[data-tool="select"] .dshEndnotePdf_text{user-select:text;}',
       // 空格抓手：按下空格后页面变抓手，拖拽平移画布；松开恢复箭头。
       '.dshEndnotePdf_page[data-tool="pan"]{cursor:grab;}',
       '.dshEndnotePdf_page[data-tool="pan"][data-panning="true"]{cursor:grabbing;}',
@@ -1188,7 +1264,7 @@ window.__ModuleLoader__.load({
       // 设置弹层：缩放与字号收在这里，工具栏只留一个「设置」按钮。
       '.dshEndnotePdf_settingsWrap{position:relative;display:inline-flex;}',
       '.dshEndnotePdf_settings{position:absolute;right:0;top:calc(100% + 4px);z-index:40;min-width:236px;padding:6px;border:1px solid var(--dsw-alias-border-secondary,#dcdfe4);border-radius:8px;background:var(--dsw-alias-bg-primary,#fff);box-shadow:0 10px 26px rgba(15,23,42,.22);}',
-      '.dshEndnotePdf_settingRow{display:flex;align-items:center;gap:4px;padding:3px 2px;}',
+      '.dshEndnotePdf_settingRow{display:flex;align-items:center;gap:8px;padding:5px 2px;}',
       '.dshEndnotePdf_settingRow+.dshEndnotePdf_settingRow{border-top:1px solid var(--dsw-alias-border-secondary,#eef0f2);}',
       '.dshEndnotePdf_settingLabel{flex:1 1 auto;font-size:12px;color:var(--dsw-alias-text-secondary,#646a73);white-space:nowrap;}',
       '.dshEndnotePdf_settingValue{min-width:40px;text-align:center;font-size:12px;color:var(--dsw-alias-text-secondary,#646a73);}',
@@ -1211,8 +1287,6 @@ window.__ModuleLoader__.load({
       '.dshEndnotePdf_menuSep{height:1px;margin:3px 2px;background:var(--dsw-alias-border-secondary,#e3e5e8);}',
       '.dshEndnotePdf_note{position:absolute;z-index:6;inset:0;display:flex;flex-direction:column;background:rgba(255,255,255,.96);border:1px solid #3b82f6;border-radius:2px;}',
       '.dshEndnotePdf_note textarea{flex:1 1 auto;min-height:0;resize:none;border:0;outline:0;font:11px/1.4 inherit;padding:4px;background:transparent;color:#111;}',
-      '.dshEndnotePdf_noteBar{display:flex;justify-content:flex-end;padding:2px;}',
-      '.dshEndnotePdf_noteBar button{font:inherit;font-size:11px;padding:1px 6px;border:1px solid #c7ccd3;border-radius:4px;background:#fff;cursor:pointer;}',
       '.dshEndnotePdf_status{font-size:12px;color:var(--dsw-alias-text-secondary,#646a73);}',
       '.dshEndnotePdf_status[data-tone=error]{color:#d93026;}',
       '.dshEndnotePdf_status[data-tone=ok]{color:#2b8a3e;}',
@@ -1229,6 +1303,25 @@ window.__ModuleLoader__.load({
       document.head.appendChild(tag)
     }
 
+    /**
+     * 幂等的 locale 注册：同一命名空间可能被多个入口（配置页 / PDF 编辑器 /
+     * 最近阅读页）各注册一次，宿主 LocaleRuntime 对重复注册会直接抛
+     * 「already has locale」，曾把整个 mount() 打断导致编辑器降级——这里吞掉
+     * 该类错误；首次注册返回的 disposer 照常交给 ctx.effect 做清理。
+     */
+    function registerLocaleSafe(locale, ns, dict) {
+      if (!locale || typeof locale.register !== 'function') return undefined
+      try {
+        return locale.register(ns, dict)
+      } catch (error) {
+        const message = String((error && error.message) || error)
+        if (message.indexOf('already') === -1) {
+          console.warn('[' + PLUGIN + '] locale 注册失败 ' + ns, error)
+        }
+        return undefined
+      }
+    }
+
     /** 懒加载插件自带的 PDF.js；worker 指向同源静态路由。 */
     let pdfjsPromise = null
     function loadPdfjs() {
@@ -1236,11 +1329,11 @@ window.__ModuleLoader__.load({
         const origin = typeof location === 'undefined' ? '' : location.origin
         const base = new URL(PDF_VENDOR, origin + '/').href
         // polyfills 先于 PDF.js 求值：旧 Chromium 缺 toHex / getOrInsertComputed。
-        pdfjsPromise = import(/* @vite-ignore */ base + 'build/polyfills.js?v=8')
+        pdfjsPromise = import(/* @vite-ignore */ base + 'build/polyfills.js')
           .catch(() => undefined)
-          .then(() => import(/* @vite-ignore */ base + 'build/pdf.min.mjs?v=8'))
+          .then(() => import(/* @vite-ignore */ base + 'build/pdf.min.mjs'))
           .then((pdfjs) => {
-            pdfjs.GlobalWorkerOptions.workerSrc = base + 'build/pdf.worker.min.mjs?v=8'
+            pdfjs.GlobalWorkerOptions.workerSrc = base + 'build/pdf.worker.min.mjs'
             return pdfjs
           })
       }
@@ -1390,6 +1483,7 @@ window.__ModuleLoader__.load({
           list: !parsed || parsed.list !== false,
           marks: !parsed || parsed.marks !== false,
           showSaved: !parsed || parsed.showSaved !== false,
+          showCount: !parsed || parsed.showCount !== false,
           fontScale: FONT_SCALES.indexOf(scale) !== -1 ? scale : 1,
           boxFill: BOX_FILLS.indexOf(fill) !== -1 ? fill : 0,
           highlightColor: isValidColor(parsed && parsed.highlightColor) ? parsed.highlightColor : PDF_DEFAULT_HIGHLIGHT,
@@ -1399,7 +1493,7 @@ window.__ModuleLoader__.load({
         }
       } catch {
         return {
-          hint: true, list: true, marks: true, showSaved: true, fontScale: 1, boxFill: 0,
+          hint: true, list: true, marks: true, showSaved: true, showCount: true, fontScale: 1, boxFill: 0,
           highlightColor: PDF_DEFAULT_HIGHLIGHT, boxColor: PDF_BOX_RED, noteColor: '#333333', extraColors: [],
         }
       }
@@ -1506,7 +1600,6 @@ window.__ModuleLoader__.load({
     const PDF_ICONS = {
       prev: [['path', { d: 'M14 5l-6 7 6 7' }]],
       next: [['path', { d: 'M10 5l6 7-6 7' }]],
-      select: [['path', { d: 'M6 3l13 8-5.6 1.2L16 19l-2.1.9-2.4-6.7L6 16z' }]],
       highlight: [['path', { d: 'M4 20h7M9.5 16.5l-3-3 7.5-7.5 3 3-7.5 7.5z' }]],
       rect: [['rect', { x: 4, y: 6, width: 16, height: 12, rx: 1 }]],
       text: [['path', { d: 'M5 6h14M12 6v13M9 19h6' }]],
@@ -1517,6 +1610,9 @@ window.__ModuleLoader__.load({
       info: [['circle', { cx: 12, cy: 12, r: 8 }], ['path', { d: 'M12 11v6M12 8h.01' }]],
       list: [['path', { d: 'M4 7h16M4 12h16M4 17h10' }]],
       tag: [['path', { d: 'M4 11V5h6l9 9-6 6-9-9zM8 8h.01' }]],
+      save: [['path', { d: 'M5 3h11l3 3v15H5z' }], ['path', { d: 'M8 3v5h7V3' }], ['path', { d: 'M7 21v-6h10v6' }]],
+      download: [['path', { d: 'M12 4v10' }], ['path', { d: 'M7 10l5 5 5-5' }], ['path', { d: 'M5 20h14' }]],
+      clock: [['circle', { cx: 12, cy: 12, r: 8 }], ['path', { d: 'M12 8v4l3 2' }]],
     }
 
     function pdfIcon(name) {
@@ -1830,6 +1926,26 @@ window.__ModuleLoader__.load({
           setPanning(true)
           return
         }
+        // 自动抓手：select 模式下空白区拖动平移画布；文字区交给浏览器原生选择。
+        if (tool === 'select') {
+          const textLayer = event.target.closest('.dshEndnotePdf_text')
+          if (textLayer) {
+            // 文字区域内：由浏览器处理选择，不清除选区。
+            return
+          }
+          const scroller = hostRef.current && hostRef.current.closest('.dshEndnotePdf_scroll')
+          if (!scroller) return
+          event.preventDefault()
+          panRef.current = {
+            x: event.clientX,
+            y: event.clientY,
+            top: scroller.scrollTop,
+            left: scroller.scrollLeft,
+            scroller,
+          }
+          setPanning(true)
+          return
+        }
         if (tool === 'rect') {
           const point = pointOf(event)
           if (!point) return
@@ -2049,7 +2165,7 @@ window.__ModuleLoader__.load({
                 h('textarea', {
                   autoFocus: true,
                   defaultValue: annotation.note || '',
-                  style: { fontSize: noteFontSize + 'px', color: ui.noteColor },
+                  style: { fontSize: noteFontSize + 'px', color: props.noteColor || '#333' },
                   placeholder: t('notePlaceholder'),
                   // 点方框外、点工具栏、切页/切换工具都会先 blur：这里直接提交，
                   // 不用再找「完成」按钮。
@@ -2073,7 +2189,7 @@ window.__ModuleLoader__.load({
               )
               : h('div', {
                 className: 'dshEndnotePdf_boxText',
-                style: { fontSize: noteFontSize + 'px', color: ui ? ui.noteColor : '#333' },
+                style: { fontSize: noteFontSize + 'px', color: props.noteColor || '#333' },
               }, annotation.note || ''),
           ),
           // 有文字且未选中时在左上角打一个小「注」标，不挡正文也不和缩放据点撞位。
@@ -2205,36 +2321,18 @@ window.__ModuleLoader__.load({
           onMouseDown: (event) => event.stopPropagation(),
           onMouseUp: (event) => event.stopPropagation(),
         },
-          // 浮动浮条色板：绿、红 + 取色器。
-          PDF_PRESET_COLORS.map((entry) => h('button', {
-            key: 'float-' + entry,
-            type: 'button',
-            className: 'dshEndnotePdf_floatDot',
-            title: t('highlight'),
-            'data-active': color === entry,
-            style: { background: entry },
-            onClick: () => applyMark('highlight', floatBar, entry),
-          })),
-          h('label', {
-            className: 'dshEndnotePdf_floatDot dshEndnotePdf_pickerLabel',
-            title: t('customColor'),
-            style: {
-              background: 'conic-gradient(red, yellow, lime, aqua, blue, magenta, red)',
+          // 浮动浮条色板：2 预设 + 彩虹键弹出快捷色与取色器。
+          h(ColorSwatchPicker, {
+            current: color,
+            dotClass: 'dshEndnotePdf_floatDot',
+            popAlign: 'right',
+            onChange: (entry) => {
+              pickColor(entry)
+              if (!PDF_COMMON_COLORS.includes(entry)) pickExtraColor(entry)
+              applyMark('highlight', floatBar, entry)
+              setFloatBar(null)
             },
-          },
-            h('input', {
-              type: 'color',
-              className: 'dshEndnotePdf_pickerInput',
-              value: color,
-              onChange: (event) => {
-                const next = event.currentTarget.value
-                pickColor(next)
-                pickExtraColor(next)
-                applyMark('highlight', floatBar, next)
-                setFloatBar(null)
-              },
-            }),
-          ),
+          }),
           h('span', { className: 'dshEndnotePdf_floatSep' }),
           h('button', { type: 'button', onClick: () => applyMark('highlight', floatBar) }, t('highlight')),
           h('button', { type: 'button', onClick: () => applyMark('underline', floatBar) }, t('underline')),
@@ -2263,36 +2361,17 @@ window.__ModuleLoader__.load({
           menu.text ? h('div', { className: 'dshEndnotePdf_menuTitle' }, menu.text.slice(0, 60)) : null,
           menu.rects ? h('div', { className: 'dshEndnotePdf_menuRow', 'data-static': true },
             h('span', { style: { marginRight: 'auto' } }, t('highlight')),
-            PDF_PRESET_COLORS.map((entry) => h('button', {
-              key: 'menu-dot-' + entry,
-              type: 'button',
-              className: 'dshEndnotePdf_floatDot',
-              title: entry,
-              'data-active': color === entry,
-              style: { background: entry, borderColor: 'rgba(0,0,0,.18)' },
-              onClick: () => applyMark('highlight', menu, entry),
-            })),
-            h('label', {
-              className: 'dshEndnotePdf_floatDot dshEndnotePdf_pickerLabel',
-              title: t('customColor'),
-              style: {
-                background: 'conic-gradient(red, yellow, lime, aqua, blue, magenta, red)',
-                borderColor: 'rgba(0,0,0,.18)',
+            h(ColorSwatchPicker, {
+              current: color,
+              dotClass: 'dshEndnotePdf_floatDot',
+              popAlign: 'right',
+              onChange: (entry) => {
+                pickColor(entry)
+                if (!PDF_COMMON_COLORS.includes(entry)) pickExtraColor(entry)
+                applyMark('highlight', menu, entry)
+                setMenu(null)
               },
-            },
-              h('input', {
-                type: 'color',
-                className: 'dshEndnotePdf_pickerInput',
-                value: color,
-                onChange: (event) => {
-                  const next = event.currentTarget.value
-                  pickColor(next)
-                  pickExtraColor(next)
-                  applyMark('highlight', menu, next)
-                  setMenu(null)
-                },
-              }),
-            ),
+            }),
           ) : null,
           menu.rects ? h('button', { type: 'button', className: 'dshEndnotePdf_menuRow', onClick: () => applyMark('underline', menu) }, t('underline')) : null,
           menu.rects ? h('button', { type: 'button', className: 'dshEndnotePdf_menuRow', onClick: () => applyMark('strike', menu) }, t('strike')) : null,
@@ -2314,10 +2393,123 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * «最近阅读»欢迎页：当右侧栏未打开 PDF 时展示最近阅读列表。
+     */
+    function EndnotePdfWelcome(props) {
+      const h = React.createElement
+      const t = props.t || (key => key)
+      const [recent, setRecent] = React.useState(null)
+      const [loading, setLoading] = React.useState(true)
+      const [error, setError] = React.useState(null)
+
+      React.useEffect(() => {
+        let alive = true
+        setLoading(true)
+        setError(null)
+        ;(async () => {
+          try {
+            const response = await fetch(PANEL_DATA_PATH + '?recent=20&added=0', { credentials: 'same-origin' })
+            if (!alive) return
+            if (!response.ok) { setError(t('recentReadLoadFailed')); return }
+            const data = await response.json()
+            if (!alive) return
+            if (data.ok !== true) { setError(t('recentReadLoadFailed')); return }
+            setRecent(Array.isArray(data.recentRead) ? data.recentRead : [])
+          } catch (cause) {
+            if (alive) setError(String(cause))
+          } finally {
+            if (alive) setLoading(false)
+          }
+        })()
+        return () => { alive = false }
+      }, [t])
+
+      const openPaper = (item) => {
+        if (!item.path || !openRecentPdf) return
+        try { openRecentPdf(item.path) } catch { /* 降级：用户可手动通过工具打开 */ }
+      }
+
+      return h('div', { className: 'dshEndnotePdf_welcome' },
+        h('h3', null, t('recentReadTitle')),
+        loading ? h('p', { role: 'status' }, t('loading')) : null,
+        error ? h('p', { style: { color: 'var(--dsw-alias-danger)' } }, error) : null,
+        recent === null || recent.length === 0
+          ? h('p', null, t('recentReadNone'))
+          : h('ul', null, recent.map((item, i) =>
+              h('li', { key: item.id || i, onClick: () => openPaper(item), title: item.folder || '' },
+                h('span', { className: 'dshEndnoteCfg_linkBtn' },
+                  (item.title || '?') + (item.year ? ' (' + item.year + ')' : '')
+                ),
+                h('span', { className: 'dshEndnoteCfg_rowPath' }, t('openInSidebar')),
+              )
+            )),
+      )
+    }
+
+    /**
      * 文档主体：工具栏 + 连续滚动页面。
      * 宿主传 bytes（bytes-complete）、resourceAddress 与 scrollportRef。
      */
+    /**
+     * 外壳：无地址也无 bytes 时显示「最近阅读」欢迎页，否则挂载编辑器视图。
+     * 必须拆成两层：欢迎页分支若和编辑器的 hooks 混在同一组件里，
+     * 「欢迎页 → 打开 PDF」的同实例 address 切换会让 hook 数量变化，
+     * React 直接抛 "Rendered fewer hooks than expected" 并崩掉整个标签页（表现为空白）。
+     */
     function EndnotePdfBody(props) {
+      const h = React.createElement
+      const bytes = props.content && props.content.kind === 'bytes' ? props.content.data : null
+      const address = props.resourceAddress || ''
+      if (!bytes && !address) {
+        const t = typeof props.t === 'function' ? props.t : (key) => key
+        return h(PdfViewErrorBoundary, null, h(EndnotePdfWelcome, { t }))
+      }
+      return h(PdfViewErrorBoundary, null, h(EndnotePdfView, props))
+    }
+
+    /** 标签条/浮窗标题：宿主把 useTabInfo 注入给 title 槽位组件（官方 TextTitle 同款）。 */
+    function EndnoteRecentPageTitle(props) {
+      const h = React.createElement
+      const useTabInfo = props && props.useTabInfo
+      if (typeof useTabInfo !== 'function') return h('span', null, 'EndNote 最近阅读')
+      const info = useTabInfo()
+      const tab = info && info.tab
+      return h('span', null, (tab && tab.title) || 'EndNote 最近阅读')
+    }
+
+    /**
+     * 独立「最近阅读」标签页主体：复用欢迎页列表，点击标题经 openRecentPdf 打开 PDF。
+     * 与 EndnotePdfBody 不同，它注册在页面级槽位 sidebar.right.pane.tab（键=RECENT_PAGE_ID），
+     * 因此会作为独立页面类型出现在右侧栏「+新标签页」导航里，无需先打开任何 PDF。
+     */
+    function EndnoteRecentPage(props) {
+      const h = React.createElement
+      const t = typeof props.t === 'function' ? props.t : (key) => key
+      return h(PdfViewErrorBoundary, null, h(EndnotePdfWelcome, { t }))
+    }
+
+    /** 「开始」页卡片图标：书本 glyph（宿主按 {size} 渲染，必须显式宽高）。 */
+    function RecentGuideIcon(props) {
+      const h = React.createElement
+      const size = (props && props.size) || 22
+      return h('svg', {
+        width: size,
+        height: size,
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 1.8,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': 'true',
+      },
+        h('path', { d: 'M4 19.5A2.5 2.5 0 0 1 6.5 17H20' }),
+        h('path', { d: 'M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z' }),
+        h('path', { d: 'M9 7h7M9 11h5' }),
+      )
+    }
+
+    function EndnotePdfView(props) {
       const h = React.createElement
       const t = typeof props.t === 'function' ? props.t : (key) => key
       const address = props.resourceAddress || ''
@@ -2328,6 +2520,7 @@ window.__ModuleLoader__.load({
         ? resource.value.absolutePath
         : ''
       const bytes = props.content && props.content.kind === 'bytes' ? props.content.data : null
+
       const [doc, setDoc] = React.useState(null)
       const [error, setError] = React.useState(null)
       const [annotations, setAnnotations] = React.useState([])
@@ -2350,7 +2543,7 @@ window.__ModuleLoader__.load({
       // 先只激活第 1 页，观察器到位后再按视口维护；null 表示全部渲染（降级）。
       const [activePages, setActivePages] = React.useState(() => new Set([1]))
       const [baseWidth, setBaseWidth] = React.useState(0)
-      // 按住空格临时变抓手（松开/失焦恢复箭头），与普通 PDF 阅读器一致。
+      // 快捷键：空格临时切抓手（松开/失焦恢复），与普通 PDF 阅读器一致。
       const [panMode, setPanMode] = React.useState(false)
       const [settingsOpen, setSettingsOpen] = React.useState(false)
       const [dirtyFlag, setDirtyFlag] = React.useState(false)
@@ -2362,6 +2555,8 @@ window.__ModuleLoader__.load({
       const [undoDepth, setUndoDepth] = React.useState(0)
       const findIndexRef = React.useRef(null)
       const docRef = React.useRef(null)
+      // 已经成功打开过的来源（url:<路径> / bytes:<字节数>）：bytes 迟到不重复下载。
+      const openedKeyRef = React.useRef('')
       const findInputRef = React.useRef(null)
       const pageObserverRef = React.useRef(null)
       // 标注侧车只接受绝对路径：useResource 还没回来时先留空，不要用相对路径去请求
@@ -2384,38 +2579,70 @@ window.__ModuleLoader__.load({
         ensurePdfCss()
       }, [])
 
-      // 打开 PDF：bytes 是宿主给的完整文件，复制一份交给 PDF.js（它会 detach）。
+      // 打开 PDF：优先走插件自己的字节路由（支持 Range，21MB 这种大文献也不会卡在
+      // 宿主 bytes-complete 通道上）；只有拿不到绝对路径时才退回宿主给的内存副本。
       React.useEffect(() => {
-        if (!bytes || bytes.length === 0) return undefined
+        const useUrl = pdfPath !== ''
+        const raw = bytes && bytes.length > 0 ? bytes : null
+        if (!useUrl && raw === null) return undefined
+        const key = useUrl ? 'url:' + pdfPath : 'bytes:' + raw.length
+        if (openedKeyRef.current === key) return undefined
         let live = true
         let task = null
-        let opened = null
+        // 兜底：20s 仍未出页面就把原因摆到界面上，不要让人对着转圈猜。
+        const timer = setTimeout(() => {
+          if (!live) return
+          const size = raw ? Math.round(raw.length / 1024) + ' KB' : '—'
+          setError(t('openTimeout') + (useUrl ? 'url:' + pdfPath : 'bytes ' + size))
+        }, 20000)
         ;(async () => {
-          try {
-            const pdfjs = await loadPdfjs()
-            const origin = typeof location === 'undefined' ? '' : location.origin
-            const base = new URL(PDF_VENDOR, origin + '/').href
-            task = pdfjs.getDocument({
-              data: new Uint8Array(bytes.slice()),
-              cMapUrl: base + 'cmaps/',
-              cMapPacked: true,
-              standardFontDataUrl: base + 'standard_fonts/',
-              wasmUrl: base + 'wasm/',
-              isEvalSupported: false,
-            })
-            opened = await task.promise
-            if (!live) { void task.destroy(); return }
-            setDoc(opened)
-            setError(null)
-          } catch (cause) {
-            if (live) setError(cause instanceof Error ? cause.message : String(cause))
+          const pdfjs = await loadPdfjs()
+          const origin = typeof location === 'undefined' ? '' : location.origin
+          const base = new URL(PDF_VENDOR, origin + '/').href
+          const options = {
+            cMapUrl: base + 'cmaps/',
+            cMapPacked: true,
+            standardFontDataUrl: base + 'standard_fonts/',
+            wasmUrl: base + 'wasm/',
+            isEvalSupported: false,
           }
+          const load = async (source) => {
+            const next = pdfjs.getDocument(Object.assign({}, options, source))
+            task = next
+            return next.promise
+          }
+          const attempts = useUrl
+            ? [{ url: PDF_BYTES_PATH + '?path=' + encodeURIComponent(pdfPath) }]
+            : [{ data: new Uint8Array(raw.slice()) }]
+          // 路由不可用（宿主没重启/老版本）时退回宿主给的内存副本，至少还能读。
+          if (useUrl && raw !== null) attempts.push({ data: new Uint8Array(raw.slice()) })
+          let failure = null
+          for (const source of attempts) {
+            try {
+              const opened = await load(source)
+              clearTimeout(timer)
+              if (!live) { void task.destroy(); return }
+              openedKeyRef.current = key
+              setDoc(opened)
+              setError(null)
+              return
+            } catch (cause) {
+              failure = cause
+              try { if (task) void task.destroy() } catch { /* 已销毁 */ }
+              task = null
+            }
+          }
+          clearTimeout(timer)
+          if (live) setError(failure instanceof Error ? failure.message : String(failure))
         })()
         return () => {
           live = false
+          clearTimeout(timer)
           try { if (task) void task.destroy() } catch { /* 已销毁 */ }
         }
-      }, [bytes])
+        // t 每次渲染都是新函数，不进依赖；超时文案取当次快照即可。
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [bytes, pdfPath])
 
       // 读取侧车标注。
       React.useEffect(() => {
@@ -2974,43 +3201,19 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dshEndnotePdf_meta' }, samplePage(currentPage, pageCount)),
           iconButton('next', 'next', t('nextPage'), { disabled: pageCount === 0 || currentPage >= pageCount, onClick: () => goToPage(Math.min(pageCount, currentPage + 1)) }),
           h('span', { className: 'dshEndnotePdf_sep' }),
-          iconButton('select', 'select', t('select'), { 'data-active': tool === 'select', onClick: () => setTool('select') }),
           iconButton('highlight', 'highlight', t('highlight'), { 'data-active': tool === 'highlight', onClick: () => setTool('highlight') }),
           iconButton('rect', 'rect', t('rect'), { 'data-active': tool === 'rect', onClick: () => setTool('rect') }),
           iconButton('text', 'text', t('text'), { 'data-active': tool === 'text', onClick: () => setTool('text') }),
           h('span', { className: 'dshEndnotePdf_sep' }),
-          // 工具栏色板：绿、红 + 取色器。
-          PDF_PRESET_COLORS.map((entry) => h('button', {
-            key: entry,
-            type: 'button',
-            className: 'dshEndnotePdf_dot',
-            title: entry,
-            'data-active': color === entry,
-            style: { background: entry },
-            onClick: () => {
+          // 工具栏色板：2 预设 + 彩虹键弹出快捷色与取色器（自定义色同时进 extraColors）。
+          h(ColorSwatchPicker, {
+            current: color,
+            onChange: (entry) => {
               pickColor(entry)
+              if (!PDF_COMMON_COLORS.includes(entry)) pickExtraColor(entry)
               if (selectedId) updateAnnotation(selectedId, { color: entry })
             },
-          })),
-          h('label', {
-            className: 'dshEndnotePdf_dot dshEndnotePdf_pickerLabel',
-            title: t('customColor'),
-            style: {
-              background: 'conic-gradient(red, yellow, lime, aqua, blue, magenta, red)',
-            },
-          },
-            h('input', {
-              type: 'color',
-              className: 'dshEndnotePdf_pickerInput',
-              value: color,
-              onChange: (event) => {
-                const next = event.currentTarget.value
-                pickColor(next)
-                pickExtraColor(next)
-                if (selectedId) updateAnnotation(selectedId, { color: next })
-              },
-            }),
-          ),
+          }),
           h('span', { className: 'dshEndnotePdf_sep' }),
           iconButton('undo', 'undo', t('undo') + ' (Ctrl+Z)', { disabled: undoDepth === 0, onClick: undo }),
           iconButton('remove', 'trash', t('remove'), { disabled: !selectedId, onClick: removeSelected }),
@@ -3049,16 +3252,16 @@ window.__ModuleLoader__.load({
                 }, t(BOX_FILL_LABELS[index]))),
               ),
               h('div', { className: 'dshEndnotePdf_settingRow' },
-                h('span', { className: 'dshEndnotePdf_settingLabel' }, t('highlightColorLabel')),
                 createColorPicker(ui.highlightColor, pickHighlightColor),
+                h('span', { className: 'dshEndnotePdf_settingLabel' }, t('highlightColorLabel')),
               ),
               h('div', { className: 'dshEndnotePdf_settingRow' },
-                h('span', { className: 'dshEndnotePdf_settingLabel' }, t('boxColorLabel')),
                 createColorPicker(ui.boxColor, pickBoxColor),
+                h('span', { className: 'dshEndnotePdf_settingLabel' }, t('boxColorLabel')),
               ),
               h('div', { className: 'dshEndnotePdf_settingRow' },
-                h('span', { className: 'dshEndnotePdf_settingLabel' }, t('noteColorLabel')),
                 createColorPicker(ui.noteColor, pickNoteColor),
+                h('span', { className: 'dshEndnotePdf_settingLabel' }, t('noteColorLabel')),
               ),
               h('div', { className: 'dshEndnotePdf_settingRow' },
                 h('label', { className: 'dshEndnotePdf_settingCheck' },
@@ -3069,19 +3272,15 @@ window.__ModuleLoader__.load({
             ) : null,
           ),
           h('span', { className: 'dshEndnotePdf_sep' }),
-          h('button', {
-            type: 'button',
-            className: 'dshEndnotePdf_btn',
-            title: t('save') + ' (Ctrl+S)',
+          // 保存/导出图标化：说明文字放在 title 悬停提示里。
+          iconButton('save', 'save', t('save') + ' (Ctrl+S)', {
             disabled: saving || !pdfPath || !dirtyFlag,
             onClick: () => saveSoon(),
-          }, saving ? t('saving') : t('save')),
-          h('button', {
-            type: 'button',
-            className: 'dshEndnotePdf_btn',
+          }),
+          iconButton('export', 'download', t('export'), {
             disabled: exporting,
             onClick: () => { void exportPdf() },
-          }, exporting ? t('exporting') : t('export')),
+          }),
           exportInfo ? h('button', {
             type: 'button',
             className: 'dshEndnotePdf_btn',
@@ -3091,6 +3290,11 @@ window.__ModuleLoader__.load({
           iconButton('hint', 'info', t('hintToggle'), { 'data-off': !ui.hint, onClick: () => toggleUi('hint') }),
           iconButton('listToggle', 'list', t('listToggle'), { 'data-off': !ui.list, onClick: () => toggleUi('list') }),
           iconButton('marks', 'tag', t('marksToggle'), { 'data-off': !ui.marks, onClick: () => toggleUi('marks') }),
+          // 保存时间 + 注释数量：一个按键整体切换显示。
+          iconButton('statusToggle', 'clock', t('statusToggle'), {
+            'data-off': !ui.showSaved,
+            onClick: () => { toggleUi('showSaved'); toggleUi('showCount') },
+          }),
           iconButton('find', 'find', t('find') + ' (Ctrl+F)', {
             'data-active': findOpen,
             onClick: () => {
@@ -3100,7 +3304,7 @@ window.__ModuleLoader__.load({
               })
             },
           }),
-          h('span', { className: 'dshEndnotePdf_meta' }, String(total)),
+          ui.showCount ? h('span', { className: 'dshEndnotePdf_meta' }, String(total)) : null,
           status && ui.showSaved ? h('span', { className: 'dshEndnotePdf_status', 'data-tone': statusTone }, status.text) : null,
         ),
         findOpen ? h('div', { className: 'dshEndnotePdf_findBar' },
@@ -3197,6 +3401,7 @@ window.__ModuleLoader__.load({
                     findMarks: findByPage.get(pageNumber) || [],
                     fontScale: ui.fontScale,
                     boxFill: ui.boxFill,
+                    noteColor: ui.noteColor,
                     annotations: byPage.get(pageNumber) || [],
                     selectedId,
                     onColor: pickColor,
@@ -3251,7 +3456,7 @@ window.__ModuleLoader__.load({
 
       const mount = () => {
         if (locale && typeof locale.register === 'function') {
-          ctx.effect(() => locale.register(PDF_NS, PDF_TEXT))
+          ctx.effect(() => registerLocaleSafe(locale, PDF_NS, PDF_TEXT))
         }
         ctx.effect(() => previews.register({
           id: PDF_EDITOR_ID,
@@ -3278,12 +3483,78 @@ window.__ModuleLoader__.load({
       const probe = new URL(PDF_VENDOR + 'build/pdf.min.mjs', location.origin + '/').href
       fetch(probe, { method: 'HEAD', credentials: 'same-origin' })
         .then((response) => {
-          if (response.ok) mount()
-          else console.warn('[' + PLUGIN + '] PDF 编辑器资源不可用（HTTP ' + response.status + '），继续使用内置预览')
+          if (!response.ok) {
+            console.warn('[' + PLUGIN + '] PDF 编辑器资源不可用（HTTP ' + response.status + '），继续使用内置预览')
+            return
+          }
+          try {
+            mount()
+          } catch (error) {
+            console.warn('[' + PLUGIN + '] PDF 编辑器挂载失败，继续使用内置预览', error)
+          }
         })
         .catch((error) => {
           console.warn('[' + PLUGIN + '] PDF 编辑器资源探测失败，继续使用内置预览', error)
         })
+    }
+
+    /**
+     * 注册「最近阅读」独立标签页（不依赖 vendor 探测；宿主缺服务时安静降级）。
+     * 结构与官方 guide/text 页面类型一致：sidebarRightTabs 注册定义，
+     * sidebar.right.pane.tab 挂主体、sidebar.right.pane.tab.title 挂标题。
+     */
+    function registerRecentPage(ctx) {
+      if (!React) {
+        console.warn('[' + PLUGIN + '] 缺少 React，最近阅读页不可用')
+        return
+      }
+      const get = (name) => (typeof ctx.get === 'function' ? ctx.get(name) : undefined)
+      const tabs = get('sidebarRightTabs')
+      const slots = get('slots')
+      const locale = get('locale')
+      if (!tabs || typeof tabs.register !== 'function') {
+        console.warn('[' + PLUGIN + '] 缺少 sidebarRightTabs，最近阅读页入口不可用（其余功能不受影响）')
+        return
+      }
+      if (!slots || typeof slots.register !== 'function' || typeof slots.inject !== 'function') {
+        console.warn('[' + PLUGIN + '] 缺少 slots，最近阅读页不可用')
+        return
+      }
+      ensurePdfCss()
+      // 每个注册独立 try/catch：一项失败（如宿主缺某个注册表）不拖累其余注册。
+      const guards = [
+        () => ctx.effect(() => tabs.register({
+          id: RECENT_PAGE_ID,
+          kind: RECENT_PAGE_KIND,
+          priority: 'extension',
+          title: () => 'EndNote 最近阅读',
+          // guide 卡片：guide 页从 definition.guide 收集卡片（refresh() flatMap），
+          // 不给 guide 数组就不会出现在「开始」页与「更多工具」里。
+          guide: [{
+            id: 'recent',
+            title: () => 'EndNote 最近阅读',
+            description: () => '快速打开最近阅读的文献 PDF',
+            icon: RecentGuideIcon,
+            order: 50,
+          }],
+        }), 'dsh-endnote: recent page type'),
+        () => ctx.effect(() => slots.inject('sidebar.right.pane.tab', () => slots.register({
+          name: 'sidebar.right.pane.tab',
+          key: RECENT_PAGE_ID,
+          locale: PDF_NS,
+        }, EndnoteRecentPage)), 'dsh-endnote: recent page body'),
+        () => ctx.effect(() => slots.inject('sidebar.right.pane.tab.title', () => slots.register({
+          name: 'sidebar.right.pane.tab.title',
+          key: RECENT_PAGE_ID,
+        }, EndnoteRecentPageTitle)), 'dsh-endnote: recent page title'),
+      ]
+      guards.forEach((run, index) => {
+        try {
+          run()
+        } catch (error) {
+          console.warn('[' + PLUGIN + '] 最近阅读页注册失败（步骤 ' + index + '）', error)
+        }
+      })
     }
 
     // React 由浏览器模块表提供（官方模板同款用法）；加载失败只降级配置页。
@@ -3293,6 +3564,50 @@ window.__ModuleLoader__.load({
     } catch (error) {
       console.warn('[' + PLUGIN + '] 加载 React 失败，配置页不可用', error)
     }
+
+    // 渲染错误边界：PDF 标签页里的任何渲染异常都直接显示成文字，
+    // 避免「崩溃后整块空白、控制台之外无任何线索」的排查困境。
+    var PdfViewErrorBoundary = null
+    if (React && React.Component) {
+      PdfViewErrorBoundary = class extends React.Component {
+        constructor(props) {
+          super(props)
+          this.state = { error: null }
+        }
+
+        static getDerivedStateFromError(error) {
+          return { error }
+        }
+
+        componentDidCatch(error, info) {
+          console.warn('[' + PLUGIN + '] PDF 视图渲染失败', error, info)
+        }
+
+        render() {
+          if (!this.state.error) return this.props.children
+          const message = this.state.error && this.state.error.message
+            ? this.state.error.message
+            : String(this.state.error || '')
+          return React.createElement('div', {
+            className: 'dshEndnotePdf_renderError',
+            style: {
+              margin: '16px',
+              padding: '12px',
+              border: '1px solid #ffa8a8',
+              borderRadius: '6px',
+              background: '#fff5f5',
+              color: '#c92a2a',
+              fontSize: '12px',
+              lineHeight: 1.5,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-all',
+            },
+          }, 'PDF 视图渲染失败：' + message)
+        }
+      }
+    }
+
+    console.info('[' + PLUGIN + '] 客户端已加载 build=2026-11-11.6（色板弹层版）')
 
     /**
      * 构造会话作用域的文件资源地址。路径按段编码，Windows 盘符（C:）也能正确回解。
@@ -3321,6 +3636,9 @@ window.__ModuleLoader__.load({
 
     return {
       inject: ['sidebarRight'],
+      // 仅供冒烟测试深入页面组件树（真实渲染不会用到）：页视图在无 doc 时不渲染，
+      // 外部无法经 slots 触达 PdfPageView，这里显式暴露一份引用。
+      __internals: { PdfPageView, EndnoteRecentPage },
       apply(ctx) {
         // 图形化配置页是可选贡献：用 ctx.inject 等待 slots/locale/configForms，
         // 任一缺失时只降级配置页，不影响下面的右侧栏 PDF 打开。
@@ -3365,6 +3683,26 @@ window.__ModuleLoader__.load({
           console.warn('[' + PLUGIN + '] PDF 编辑器注册失败', error)
         }
 
+        // 「最近阅读」独立标签页：出现在右侧栏「+新标签页」导航里。
+        // sidebarRightTabs 缺失（旧宿主）时安静降级，不影响其他功能。
+        try {
+          if (typeof ctx.inject === 'function') {
+            const handle = ctx.inject(['sidebarRightTabs', 'slots', 'locale'], (child) => {
+              registerRecentPage(child)
+            })
+            ctx.effect(() => () => {
+              try {
+                if (handle && typeof handle.dispose === 'function') handle.dispose()
+                else if (typeof handle === 'function') handle()
+              } catch (error) {
+                console.warn('[' + PLUGIN + '] 最近阅读页清理失败', error)
+              }
+            })
+          }
+        } catch (error) {
+          console.warn('[' + PLUGIN + '] 最近阅读页注册失败', error)
+        }
+
         const sidebar = ctx.sidebarRight
         const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
         if (!sidebar || typeof sidebar.openResource !== 'function') {
@@ -3378,6 +3716,14 @@ window.__ModuleLoader__.load({
 
         let current = null
         let attaching = 0
+
+        // 暴露给 EndnotePdfWelcome / 面板列表的回调：用当前会话打开 PDF。
+        openRecentPdf = (filePath) => {
+          const id = current ? current.sessionId : (typeof sidebar.mounted === 'function' ? sidebar.mounted() : undefined)
+          if (id && filePath) open(id, filePath)
+        }
+        // 面板「最近阅读/最近导入」的标题点击：同样在右侧栏打开（关掉标签后可从这里重开）。
+        openPdfInSidebar = openRecentPdf
 
         const release = () => {
           if (!current) return

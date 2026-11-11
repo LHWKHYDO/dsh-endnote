@@ -54,6 +54,8 @@ const MAX_BODY_BYTES = 64 * 1024
 const MAX_ANNOTATION_BODY_BYTES = 8 * 1024 * 1024
 /** PDF 标注侧车读写路由（读 GET ?path=，写 POST {path, annotations}）。 */
 const PDF_ANNOTATION_PATH = '/dsh-endnote/pdf-annotations'
+/** PDF 原始字节路由（GET/HEAD ?path=，支持 Range）：编辑器自己拉取，不占用宿主 bytes 通道。 */
+const PDF_BYTES_PATH = '/dsh-endnote/pdf-bytes'
 /** 内置 PDF.js 静态资源前缀（客户端半边按需 import）。 */
 const PDFJS_PREFIX = '/dsh-endnote/vendor/pdfjs'
 /** 导出带原生注释的 PDF 副本（只写插件 dataDir）。 */
@@ -87,7 +89,7 @@ function textRender(lines) {
 
 /**
  * 构造一个最小的工具定义（schema + execute + render），无需依赖 dsh-tools。
- * @param {{ name: string, description: string, parameters: object, outputSchema: object, render: (value: any) => string, execute: (args: any, exec: any) => Promise<any> }} spec
+ * @param {{ name: string, description: string, parameters: object, outputSchema: object, render: (value: any) => string, execute: (args: any) => Promise<any> }} spec
  */
 function tool(spec) {
   return {
@@ -104,7 +106,7 @@ function tool(spec) {
           : {},
     },
     async execute(args) {
-      return spec.execute(args ?? {}, arguments)
+      return spec.execute(args ?? {})
     },
   }
 }
@@ -394,30 +396,13 @@ export function apply(ctx, rawConfig) {
           const requested = Number(args.limit)
           const limit = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 15
           const log = readReadLog(path.join(config.dataDir, 'read-log.jsonl'))
-          const merged = []
-          for (const entry of index.entries) {
-            const logTs = log[entry.id] || 0
-            const dbTs = entry.readAt || 0
-            const ts = Math.max(logTs, dbTs)
-            if (!ts) continue
-            const pdf = entry.files.find((file) => file.exists) ?? entry.files[0]
-            merged.push({
-              ts,
-              item: {
-                id: entry.id,
-                title: entry.title || '（无标题）',
-                year: entry.year || '',
-                read: entry.read === true ? 'read' : entry.read === false ? 'unread' : 'unknown',
-                rating: entry.rating || 0,
-                lastReadAt: formatEpoch(ts),
-                source: logTs >= dbTs && logTs > 0 ? 'plugin-log' : 'endnote-readstatus',
-                folder: pdf ? path.dirname(pdf.path) : '',
-                path: pdf ? pdf.path : '',
-              },
-            })
-          }
-          merged.sort((left, right) => right.ts - left.ts || right.item.id - left.item.id)
-          return { total: merged.length, items: merged.slice(0, limit).map((row) => row.item) }
+          const rows = collectRecentReads(index.entries, log, Infinity)
+          const items = rows.slice(0, limit).map(({ ts, source, entry }) => ({
+            ...recentItemOf(entry, ts),
+            lastReadAt: formatEpoch(ts),
+            source,
+          }))
+          return { total: rows.length, items }
         },
       }),
     ),
@@ -625,36 +610,14 @@ export function apply(ctx, rawConfig) {
     try {
       index = loadOrExplain()
     } catch (error) {
-      payload.error = String((error && error.message) || error)
+      payload.error = errorMessageOf(error)
       return payload
     }
     const entries = index.entries
-    const fileOf = (entry) => {
-      const file = (entry.files || []).find((item) => item.exists) || (entry.files || [])[0] || null
-      return file ? file.path : ''
-    }
-    const readLabel = (entry) => (entry.read === true ? 'read' : entry.read === false ? 'unread' : 'unknown')
 
-    // 最近阅读：插件阅读日志 ∪ EndNote 读状态变更时间，取大者倒序。
+    // 最近阅读：与 endnote_recent 共用 collectRecentReads（插件日志 ∪ EndNote 读状态时间取大者倒序）。
     const log = readReadLog(path.join(config.dataDir, 'read-log.jsonl'))
-    payload.recentRead = entries
-      .map((entry) => ({ entry, lastReadAt: Math.max(Number(log[entry.id] || 0), Number(entry.readAt || 0)) }))
-      .filter((row) => row.lastReadAt > 0)
-      .sort((a, b) => b.lastReadAt - a.lastReadAt)
-      .slice(0, recentN)
-      .map(({ entry, lastReadAt }) => {
-        const file = fileOf(entry)
-        return {
-          id: entry.id,
-          title: entry.title || '（无标题）',
-          year: entry.year || '',
-          read: readLabel(entry),
-          rating: Number(entry.rating || 0),
-          lastReadAt,
-          folder: file ? path.dirname(file) : '',
-          path: file,
-        }
-      })
+    payload.recentRead = collectRecentReads(entries, log, recentN).map(({ ts, entry }) => recentItemOf(entry, ts))
 
     // 最近导入：EndNote 的入库时间（added_to_library）倒序。
     payload.recentAdded = entries
@@ -662,17 +625,8 @@ export function apply(ctx, rawConfig) {
       .sort((a, b) => Number(b.addedAt || 0) - Number(a.addedAt || 0))
       .slice(0, addedN)
       .map((entry) => {
-        const file = fileOf(entry)
-        return {
-          id: entry.id,
-          title: entry.title || '（无标题）',
-          year: entry.year || '',
-          read: readLabel(entry),
-          rating: Number(entry.rating || 0),
-          addedAt: Number(entry.addedAt || 0),
-          folder: file ? path.dirname(file) : '',
-          path: file,
-        }
+        const item = recentItemOf(entry, 0)
+        return { ...item, lastReadAt: undefined, addedAt: Number(entry.addedAt || 0) }
       })
 
     // 初步统计汇总。
@@ -734,7 +688,7 @@ export function apply(ctx, rawConfig) {
           const addedN = clampInt(url.searchParams.get('added'), 10, 0, 100)
           sendJson(res, 200, buildPanelPayload(recentN, addedN))
         } catch (error) {
-          sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
+          sendJson(res, 500, { ok: false, error: errorMessageOf(error) })
         }
       },
     }), `dsh-endnote: GET ${PANEL_DATA_PATH}`)
@@ -747,18 +701,8 @@ export function apply(ctx, rawConfig) {
         try {
           const rejection = connection.requestRejection(req)
           if (rejection !== undefined) { res.statusCode = rejection; res.end(); return }
-          if (req.method !== 'POST') { res.statusCode = 405; res.setHeader('allow', 'POST'); res.end(); return }
-          const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase()
-          if (contentType !== 'application/json') { sendJson(res, 415, { ok: false, error: 'content-type must be application/json' }); return }
-          const body = await readBoundedBody(req)
-          if (body === null) { sendJson(res, 413, { ok: false, error: 'body too large' }); return }
-          let parsed = null
-          try {
-            parsed = JSON.parse(body)
-          } catch {
-            sendJson(res, 400, { ok: false, error: 'invalid JSON' })
-            return
-          }
+          const parsed = await readJsonPost(req, res)
+          if (parsed === null) return
           const target = parsed && parsed.path
           if (typeof target !== 'string' || !path.isAbsolute(target)) { sendJson(res, 400, { ok: false, error: 'path must be an absolute string' }); return }
           try {
@@ -771,7 +715,7 @@ export function apply(ctx, rawConfig) {
           if (!openDirectory(target)) { sendJson(res, 500, { ok: false, error: 'could not start the system file manager' }); return }
           sendJson(res, 200, { ok: true })
         } catch (error) {
-          sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
+          sendJson(res, 500, { ok: false, error: errorMessageOf(error) })
         }
       },
     }), `dsh-endnote: POST ${OPEN_FOLDER_PATH}`)
@@ -798,26 +742,8 @@ export function apply(ctx, rawConfig) {
             sendJson(res, 200, { ok: true, path: target, ...loaded })
             return
           }
-          if (req.method !== 'POST') {
-            res.statusCode = 405
-            res.setHeader('allow', 'GET, POST')
-            res.end()
-            return
-          }
-          const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase()
-          if (contentType !== 'application/json') {
-            sendJson(res, 415, { ok: false, error: 'content-type must be application/json' })
-            return
-          }
-          const body = await readBoundedBody(req, MAX_ANNOTATION_BODY_BYTES)
-          if (body === null) { sendJson(res, 413, { ok: false, error: 'body too large' }); return }
-          let parsed = null
-          try {
-            parsed = JSON.parse(body)
-          } catch {
-            sendJson(res, 400, { ok: false, error: 'invalid JSON' })
-            return
-          }
+          const parsed = await readJsonPost(req, res, { allow: 'GET, POST', limit: MAX_ANNOTATION_BODY_BYTES })
+          if (parsed === null) return
           const target = parsed && parsed.path
           if (typeof target !== 'string' || !path.isAbsolute(target)) {
             sendJson(res, 400, { ok: false, error: 'path must be an absolute string' })
@@ -841,7 +767,7 @@ export function apply(ctx, rawConfig) {
           const saved = writeAnnotations(config.dataDir, target, parsed.annotations)
           sendJson(res, 200, { ok: true, path: target, count: saved.annotations.length, updatedAt: saved.updatedAt, pdfStamp: saved.pdfStamp })
         } catch (error) {
-          sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
+          sendJson(res, 500, { ok: false, error: errorMessageOf(error) })
         }
       },
     }), `dsh-endnote: ${PDF_ANNOTATION_PATH}`)
@@ -854,26 +780,8 @@ export function apply(ctx, rawConfig) {
         try {
           const rejection = connection.requestRejection(req)
           if (rejection !== undefined) { res.statusCode = rejection; res.end(); return }
-          if (req.method !== 'POST') {
-            res.statusCode = 405
-            res.setHeader('allow', 'POST')
-            res.end()
-            return
-          }
-          const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase()
-          if (contentType !== 'application/json') {
-            sendJson(res, 415, { ok: false, error: 'content-type must be application/json' })
-            return
-          }
-          const body = await readBoundedBody(req, MAX_ANNOTATION_BODY_BYTES)
-          if (body === null) { sendJson(res, 413, { ok: false, error: 'body too large' }); return }
-          let parsed = null
-          try {
-            parsed = JSON.parse(body)
-          } catch {
-            sendJson(res, 400, { ok: false, error: 'invalid JSON' })
-            return
-          }
+          const parsed = await readJsonPost(req, res)
+          if (parsed === null) return
           const target = parsed && parsed.path
           if (typeof target !== 'string' || !path.isAbsolute(target) || path.extname(target).toLowerCase() !== '.pdf') {
             sendJson(res, 400, { ok: false, error: 'path must be an absolute .pdf path' })
@@ -893,11 +801,101 @@ export function apply(ctx, rawConfig) {
           const result = await exportAnnotatedPdf(target, parsed.annotations, path.join(config.dataDir, 'exports'))
           sendJson(res, 200, { ok: true, path: target, ...result })
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          sendJson(res, 500, { ok: false, error: message })
+          sendJson(res, 500, { ok: false, error: errorMessageOf(error) })
         }
       },
     }), `dsh-endnote: POST ${EXPORT_PDF_PATH}`)
+
+    // ------------------------------------------------------------------
+    // PDF 原始字节：GET/HEAD ?path=<绝对路径>，支持 Range。
+    // 编辑器原先靠宿主的 bytes-complete 整包注入，20MB+ 的文献会长时间转圈；
+    // 改成编辑器自己按需拉取，pdf.js 还能用 Range 分段读。只读，只放行存在的 .pdf。
+    // ------------------------------------------------------------------
+    webCtx.effect(() => webServer.register({
+      kind: 'exact',
+      path: PDF_BYTES_PATH,
+      handler: async (req, res) => {
+        try {
+          const rejection = connection.requestRejection(req)
+          if (rejection !== undefined) { res.statusCode = rejection; res.end(); return }
+          if (req.method !== 'GET' && req.method !== 'HEAD') {
+            res.statusCode = 405
+            res.setHeader('allow', 'GET, HEAD')
+            res.end()
+            return
+          }
+          const url = new URL(String(req.url || PDF_BYTES_PATH), 'http://127.0.0.1')
+          const target = url.searchParams.get('path')
+          if (typeof target !== 'string' || !path.isAbsolute(target) || path.extname(target).toLowerCase() !== '.pdf') {
+            sendJson(res, 400, { ok: false, error: 'path must be an absolute .pdf path' })
+            return
+          }
+          const stat = await fs.promises.stat(target).catch(() => null)
+          if (stat === null || !stat.isFile()) {
+            sendJson(res, 404, { ok: false, error: 'PDF does not exist' })
+            return
+          }
+          const total = stat.size
+          res.setHeader('content-type', 'application/pdf')
+          res.setHeader('accept-ranges', 'bytes')
+          res.setHeader('cache-control', 'no-store')
+          // 大小+mtime 做 ETag：文件被替换后缓存自动失效。
+          res.setHeader('etag', `"${total.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`)
+
+          const range = typeof req.headers.range === 'string' ? req.headers.range.trim() : ''
+          if (range !== '') {
+            const match = /^bytes=(\d*)-(\d*)$/.exec(range)
+            if (match === null || (match[1] === '' && match[2] === '')) {
+              res.statusCode = 416
+              res.setHeader('content-range', `bytes */${total}`)
+              res.end()
+              return
+            }
+            let start = 0
+            let end = total - 1
+            if (match[1] === '') {
+              const suffix = Number(match[2])
+              if (!Number.isFinite(suffix) || suffix <= 0) {
+                res.statusCode = 416
+                res.setHeader('content-range', `bytes */${total}`)
+                res.end()
+                return
+              }
+              start = Math.max(0, total - suffix)
+            } else {
+              start = Number(match[1])
+              end = match[2] === '' ? total - 1 : Math.min(Number(match[2]), total - 1)
+            }
+            if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) {
+              res.statusCode = 416
+              res.setHeader('content-range', `bytes */${total}`)
+              res.end()
+              return
+            }
+            res.statusCode = 206
+            res.setHeader('content-range', `bytes ${start}-${end}/${total}`)
+            res.setHeader('content-length', String(end - start + 1))
+            if (req.method === 'HEAD') { res.end(); return }
+            const partial = fs.createReadStream(target, { start, end })
+            partial.on('error', () => { try { res.destroy() } catch { /* 已断开 */ } })
+            partial.pipe(res)
+            return
+          }
+
+          res.statusCode = 200
+          res.setHeader('content-length', String(total))
+          if (req.method === 'HEAD') { res.end(); return }
+          const stream = fs.createReadStream(target)
+          stream.on('error', () => { try { res.destroy() } catch { /* 已断开 */ } })
+          stream.pipe(res)
+        } catch (error) {
+          try {
+            res.statusCode = 500
+            res.end(error instanceof Error ? error.message : String(error))
+          } catch { /* 已断开 */ }
+        }
+      },
+    }), `dsh-endnote: ${PDF_BYTES_PATH}`)
 
     // ------------------------------------------------------------------
     // 内置 PDF.js 静态资源：客户端编辑器按需 import / new Worker。
@@ -1036,6 +1034,43 @@ function formatEpoch(ts) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
+/**
+ * 最近阅读公共实现（endnote_recent 与面板 recentRead 共用）：
+ * 插件日志 ∪ EndNote 读状态变更时间取大者，倒序取前 limit 条。
+ * @returns {Array<{ ts: number, source: string, entry: object }>}
+ */
+function collectRecentReads(entries, log, limit) {
+  return entries
+    .map((entry) => {
+      const logTs = Number(log[entry.id] || 0)
+      const dbTs = Number(entry.readAt || 0)
+      return {
+        entry,
+        ts: Math.max(logTs, dbTs),
+        source: logTs >= dbTs && logTs > 0 ? 'plugin-log' : 'endnote-readstatus',
+      }
+    })
+    .filter((row) => row.ts > 0)
+    .sort((left, right) => right.ts - left.ts || right.entry.id - left.entry.id)
+    .slice(0, limit)
+}
+
+/** 最近阅读条目的公共字段（lastReadAt 为原始 epoch 秒；调用方按需格式化）。 */
+function recentItemOf(entry, ts) {
+  const file = (entry.files || []).find((item) => item.exists) || (entry.files || [])[0] || null
+  const filePath = file ? file.path : ''
+  return {
+    id: entry.id,
+    title: entry.title || '（无标题）',
+    year: entry.year || '',
+    read: entry.read === true ? 'read' : entry.read === false ? 'unread' : 'unknown',
+    rating: Number(entry.rating || 0),
+    lastReadAt: ts,
+    folder: filePath ? path.dirname(filePath) : '',
+    path: filePath,
+  }
+}
+
 /** @param {Record<string, unknown>} config */
 function formatConfig(config) {
   return Object.entries(config)
@@ -1051,19 +1086,53 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload))
 }
 
-/** 读取 JSON 请求体；超过 MAX_BODY_BYTES 时排空后续字节并返回 null（内存有界）。 */
-async function readBoundedBody(req) {
+/** 读取 JSON 请求体；超过 limit（默认 MAX_BODY_BYTES）时排空后续字节并返回 null（内存有界）。 */
+async function readBoundedBody(req, limit = MAX_BODY_BYTES) {
   let size = 0
   const chunks = []
   for await (const chunk of req) {
     size += chunk.length
-    if (size > MAX_BODY_BYTES) {
+    if (size > limit) {
       chunks.length = 0 // 超限后只排空不保存，保证还能正常回 413。
       continue
     }
     chunks.push(chunk)
   }
-  return size > MAX_BODY_BYTES ? null : Buffer.concat(chunks).toString('utf8')
+  return size > limit ? null : Buffer.concat(chunks).toString('utf8')
+}
+
+/** error → 可读消息（各路由 catch 与工具 catch 共用）。 */
+function errorMessageOf(error) {
+  return error instanceof Error ? error.message : String((error && error.message) || error)
+}
+
+/**
+ * POST JSON 路由的公共前置：method → content-type → 请求体 → JSON 解析。
+ * 校验失败时已写好错误响应并返回 null；成功返回解析后的对象。
+ */
+async function readJsonPost(req, res, { allow = 'POST', limit = MAX_BODY_BYTES } = {}) {
+  if (req.method !== 'POST') {
+    res.statusCode = 405
+    res.setHeader('allow', allow)
+    res.end()
+    return null
+  }
+  const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase()
+  if (contentType !== 'application/json') {
+    sendJson(res, 415, { ok: false, error: 'content-type must be application/json' })
+    return null
+  }
+  const body = await readBoundedBody(req, limit)
+  if (body === null) {
+    sendJson(res, 413, { ok: false, error: 'body too large' })
+    return null
+  }
+  try {
+    return JSON.parse(body)
+  } catch {
+    sendJson(res, 400, { ok: false, error: 'invalid JSON' })
+    return null
+  }
 }
 
 /** 查询参数 → 受限整数（NaN/越界回退）。 */
