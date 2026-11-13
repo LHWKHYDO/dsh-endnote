@@ -1023,6 +1023,7 @@ window.__ModuleLoader__.load({
         sizeLarge: '大',
         noteColorLabel: '标注文字颜色',
         showSavedLabel: '显示已保存提示',
+        wsScrollLabel: 'W/S 键上下移动画布',
         statusToggle: '保存时间/注释数量',
         boxFillLabel: '方框填充',
         fillNone: '无',
@@ -1090,6 +1091,7 @@ window.__ModuleLoader__.load({
         sizeLarge: 'L',
         noteColorLabel: 'Note text colour',
         showSavedLabel: 'Show saved status',
+        wsScrollLabel: 'W/S keys scroll the canvas',
         statusToggle: 'Saved time / annotation count',
         boxFillLabel: 'Box fill',
         fillNone: 'None',
@@ -1267,6 +1269,9 @@ window.__ModuleLoader__.load({
       '.dshEndnotePdf_settingRow{display:flex;align-items:center;gap:8px;padding:5px 2px;}',
       '.dshEndnotePdf_settingRow+.dshEndnotePdf_settingRow{border-top:1px solid var(--dsw-alias-border-secondary,#eef0f2);}',
       '.dshEndnotePdf_settingLabel{flex:1 1 auto;font-size:12px;color:var(--dsw-alias-text-secondary,#646a73);white-space:nowrap;}',
+      '.dshEndnotePdf_btnGroup{display:flex;flex:1 1 auto;gap:4px;}',
+      '.dshEndnotePdf_btnGroup .dshEndnotePdf_btn{flex:1 1 0;min-width:0;padding:3px 6px;text-align:center;white-space:nowrap;}',
+      '.dshEndnotePdf_settingRow:has(.dshEndnotePdf_btnGroup) .dshEndnotePdf_settingLabel{flex:0 0 auto;}',
       '.dshEndnotePdf_settingValue{min-width:40px;text-align:center;font-size:12px;color:var(--dsw-alias-text-secondary,#646a73);}',
       '.dshEndnotePdf_settingRow .dshEndnotePdf_btn{padding:2px 7px;}',
       '.dshEndnotePdf_draft{position:absolute;border:2px dashed #3b82f6;background:rgba(59,130,246,.12);pointer-events:none;}',
@@ -1484,6 +1489,7 @@ window.__ModuleLoader__.load({
           marks: !parsed || parsed.marks !== false,
           showSaved: !parsed || parsed.showSaved !== false,
           showCount: !parsed || parsed.showCount !== false,
+          wsScroll: parsed ? parsed.wsScroll === true : false,
           fontScale: FONT_SCALES.indexOf(scale) !== -1 ? scale : 1,
           boxFill: BOX_FILLS.indexOf(fill) !== -1 ? fill : 0,
           highlightColor: isValidColor(parsed && parsed.highlightColor) ? parsed.highlightColor : PDF_DEFAULT_HIGHLIGHT,
@@ -1493,7 +1499,7 @@ window.__ModuleLoader__.load({
         }
       } catch {
         return {
-          hint: true, list: true, marks: true, showSaved: true, showCount: true, fontScale: 1, boxFill: 0,
+          hint: true, list: true, marks: true, showSaved: true, showCount: true, wsScroll: false, fontScale: 1, boxFill: 0,
           highlightColor: PDF_DEFAULT_HIGHLIGHT, boxColor: PDF_BOX_RED, noteColor: '#333333', extraColors: [],
         }
       }
@@ -3102,7 +3108,25 @@ window.__ModuleLoader__.load({
         return () => clearTimeout(timer)
       }, [annotations, pdfPath, t])
 
-      // 键盘：Delete 删除选中，Ctrl/Cmd+Z 撤销，Esc 退出编辑态。
+      /** 滚动时更新当前页。 */
+      const onScroll = () => {
+        const host = scrollRef.current
+        if (!host) return
+        const middle = host.getBoundingClientRect().top + host.clientHeight / 2
+        let best = currentPage
+        for (const [page, element] of pageRefs.current) {
+          const rect = element.getBoundingClientRect()
+          if (rect.top <= middle && rect.bottom >= middle) { best = page; break }
+        }
+        if (best !== currentPage) setCurrentPage(best)
+      }
+
+      const goToPage = (page) => {
+        const element = pageRefs.current.get(page)
+        if (element && element.scrollIntoView) element.scrollIntoView({ block: 'start' })
+      }
+
+      // 键盘：Delete 删除选中，Ctrl/Cmd+Z 撤销，Esc 退出编辑态；方向键平移画布，PageUp/PageDown 翻页。
       React.useEffect(() => {
         if (typeof window === 'undefined') return undefined
         const onKey = (event) => {
@@ -3130,29 +3154,45 @@ window.__ModuleLoader__.load({
           } else if (event.key === 'Escape') {
             if (findOpen) setFindOpen(false)
             else setSelectedId(null)
+          } else if (ui.wsScroll && (event.key === 'w' || event.key === 's' || event.key === 'W' || event.key === 'S')) {
+            // W / S：上下移动画布（设置里可开关）。
+            const host = scrollRef.current
+            if (host) {
+              event.preventDefault()
+              const delta = 60
+              const up = event.key === 'w' || event.key === 'W'
+              host.scrollTop = Math.max(0, host.scrollTop + (up ? -delta : delta))
+            }
+          } else if (event.altKey || event.metaKey || event.ctrlKey) {
+            // 修饰键组合留给宿主快捷键，不抢。
+          } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+            // 左右方向键：水平移动画布。
+            const host = scrollRef.current
+            if (host) {
+              event.preventDefault()
+              const delta = 60
+              host.scrollLeft = Math.max(0, host.scrollLeft + (event.key === 'ArrowLeft' ? -delta : delta))
+            }
+          } else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+            // 上下方向键：竖直滚动画布。
+            const host = scrollRef.current
+            if (host) {
+              event.preventDefault()
+              const delta = 60
+              host.scrollTop = Math.max(0, host.scrollTop + (event.key === 'ArrowUp' ? -delta : delta))
+            }
+          } else if (event.key === 'PageUp' || event.key === 'PageDown') {
+            // PageUp / PageDown：翻页。
+            event.preventDefault()
+            const target = event.key === 'PageUp'
+              ? Math.max(1, currentPage - 1)
+              : Math.min(pageCount || 1, currentPage + 1)
+            if (target !== currentPage) goToPage(target)
           }
         }
         window.addEventListener('keydown', onKey)
         return () => window.removeEventListener('keydown', onKey)
-      }, [selectedId, removeSelected, undo, findOpen, saveSoon])
-
-      /** 滚动时更新当前页。 */
-      const onScroll = () => {
-        const host = scrollRef.current
-        if (!host) return
-        const middle = host.getBoundingClientRect().top + host.clientHeight / 2
-        let best = currentPage
-        for (const [page, element] of pageRefs.current) {
-          const rect = element.getBoundingClientRect()
-          if (rect.top <= middle && rect.bottom >= middle) { best = page; break }
-        }
-        if (best !== currentPage) setCurrentPage(best)
-      }
-
-      const goToPage = (page) => {
-        const element = pageRefs.current.get(page)
-        if (element && element.scrollIntoView) element.scrollIntoView({ block: 'start' })
-      }
+      }, [selectedId, removeSelected, undo, findOpen, saveSoon, currentPage, pageCount, goToPage, ui.wsScroll])
 
       const byPage = React.useMemo(() => {
         const map = new Map()
@@ -3233,23 +3273,27 @@ window.__ModuleLoader__.load({
               ),
               h('div', { className: 'dshEndnotePdf_settingRow' },
                 h('span', { className: 'dshEndnotePdf_settingLabel' }, t('fontSizeLabel')),
-                FONT_SCALES.map((scale, index) => h('button', {
-                  key: 'font-' + scale,
-                  type: 'button',
-                  className: 'dshEndnotePdf_btn',
-                  'data-active': Math.abs(ui.fontScale - scale) < 0.001,
-                  onClick: () => pickFontScale(scale),
-                }, t(FONT_SIZE_LABELS[index]))),
+                h('span', { className: 'dshEndnotePdf_btnGroup' },
+                  FONT_SCALES.map((scale, index) => h('button', {
+                    key: 'font-' + scale,
+                    type: 'button',
+                    className: 'dshEndnotePdf_btn',
+                    'data-active': Math.abs(ui.fontScale - scale) < 0.001,
+                    onClick: () => pickFontScale(scale),
+                  }, t(FONT_SIZE_LABELS[index]))),
+                ),
               ),
               h('div', { className: 'dshEndnotePdf_settingRow' },
                 h('span', { className: 'dshEndnotePdf_settingLabel' }, t('boxFillLabel')),
-                BOX_FILLS.map((fill, index) => h('button', {
-                  key: 'fill-' + fill,
-                  type: 'button',
-                  className: 'dshEndnotePdf_btn',
-                  'data-active': ui.boxFill === fill,
-                  onClick: () => pickBoxFill(fill),
-                }, t(BOX_FILL_LABELS[index]))),
+                h('span', { className: 'dshEndnotePdf_btnGroup' },
+                  BOX_FILLS.map((fill, index) => h('button', {
+                    key: 'fill-' + fill,
+                    type: 'button',
+                    className: 'dshEndnotePdf_btn',
+                    'data-active': ui.boxFill === fill,
+                    onClick: () => pickBoxFill(fill),
+                  }, t(BOX_FILL_LABELS[index]))),
+                ),
               ),
               h('div', { className: 'dshEndnotePdf_settingRow' },
                 createColorPicker(ui.highlightColor, pickHighlightColor),
@@ -3267,6 +3311,12 @@ window.__ModuleLoader__.load({
                 h('label', { className: 'dshEndnotePdf_settingCheck' },
                   h('input', { type: 'checkbox', checked: ui.showSaved, onChange: () => toggleUi('showSaved') }),
                   h('span', null, t('showSavedLabel')),
+                ),
+              ),
+              h('div', { className: 'dshEndnotePdf_settingRow' },
+                h('label', { className: 'dshEndnotePdf_settingCheck' },
+                  h('input', { type: 'checkbox', checked: ui.wsScroll, onChange: () => toggleUi('wsScroll') }),
+                  h('span', null, t('wsScrollLabel')),
                 ),
               ),
             ) : null,

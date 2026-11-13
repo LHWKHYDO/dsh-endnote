@@ -96,7 +96,7 @@ Data flows over same-origin routes — `GET /dsh-endnote/panel-data`, `POST /dsh
 
 - **Colour picker**: toolbar / selection floater / context menu / settings share one swatch component — an inline “current colour square” that opens a popup with 7 common quick colours plus the native picker; it closes when you click outside. The three settings rows (highlight / box / note text) use the same aligned style.
 - **Buttons**: Save and Export are icon buttons with hover tooltips; the clock icon toggles the saved-status / annotation-count display (the settings panel can also toggle the saved hint separately).
-- **Canvas**: with the default tool the blank area is a grab hand (drag to pan) and turns into text selection over text — drag-select to highlight; hold Space to force the hand.
+- **Canvas**: with the default tool the blank area is a grab hand (drag to pan) and turns into text selection over text — drag-select to highlight; hold Space to force the hand; arrow keys move the canvas and `PageUp`/`PageDown` turn pages; a settings toggle binds W/S to vertical canvas scrolling.
 
 ## Index
 
