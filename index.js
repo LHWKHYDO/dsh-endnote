@@ -48,6 +48,8 @@ const packageDir = path.dirname(fileURLToPath(import.meta.url))
 const PANEL_DATA_PATH = '/dsh-endnote/panel-data'
 /** 打开本地文件夹路由（explorer / open / xdg-open）。 */
 const OPEN_FOLDER_PATH = '/dsh-endnote/open-folder'
+/** 重建索引路由（面板「刷新」按钮；POST，耗时数秒）。 */
+const REBUILD_INDEX_PATH = '/dsh-endnote/rebuild-index'
 /** JSON 请求体上限（与官方 open-in-app 一致）。 */
 const MAX_BODY_BYTES = 64 * 1024
 /** 标注侧车请求体上限：2000 条标注留足余量。 */
@@ -575,24 +577,76 @@ export function apply(ctx, rawConfig) {
           ? `索引已重建：${value.indexFile}（${value.entries} 条，${value.withPdf} 条有 PDF）\n${value.output}`
           : `索引重建失败：\n${value.output}`,
         async execute() {
-          syncConfig()
-          const out = preferredIndexFile(config)
-          fs.mkdirSync(config.dataDir, { recursive: true })
-          const script = path.join(packageDir, 'scripts', 'endnote_index.py')
-          const run = await runPython(config.pythonPath, [script, '--lib', config.libraryPath, '--out', out])
-          store.invalidate()
-          const built = run.ok && fs.existsSync(out) ? new IndexStore({ ...config, indexFile: out }).load() : null
-          return {
-            ok: Boolean(built && built.entries.length),
-            indexFile: out,
-            entries: built ? built.entries.length : 0,
-            withPdf: built ? built.entries.filter((entry) => entry.files.some((file) => file.exists)).length : 0,
-            output: run.output,
-          }
+          // 工具语义=显式重建：跳过新鲜度检查强制执行。
+          return rebuildIndexNow(true)
         },
       }),
     ),
   )
+
+  /** 重建索引（endnote_rebuild 工具与面板刷新路由共用；并发时单飞复用同一次构建）。
+   *  效率保护：库未比索引新时直接跳过 Python 重建，只回读现有索引（毫秒级返回）。 */
+  let rebuildInFlight = null
+  const indexIsFresh = () => {
+    if (!config.libraryPath) return false
+    const indexFile = preferredIndexFile(config)
+    if (!indexFile || !fs.existsSync(indexFile)) return false
+    const sdbFile = path.join(config.libraryPath, 'sdb', 'sdb.eni')
+    if (!fs.existsSync(sdbFile)) return false
+    try {
+      return fs.statSync(sdbFile).mtimeMs <= fs.statSync(indexFile).mtimeMs
+    } catch {
+      return false
+    }
+  }
+  const summarizeIndex = (out) => {
+    store.invalidate()
+    const built = fs.existsSync(out) ? new IndexStore({ ...config, indexFile: out }).load() : null
+    return {
+      ok: Boolean(built && built.entries.length),
+      indexFile: out,
+      entries: built ? built.entries.length : 0,
+      withPdf: built ? built.entries.filter((entry) => entry.files.some((file) => file.exists)).length : 0,
+      output: '',
+    }
+  }
+  const rebuildIndexNow = async (force = false) => {
+    syncConfig()
+    const out = preferredIndexFile(config)
+    // 冗余保护：索引已比库新 → 不跑 Python，直接汇总现有索引（强制重建除外）。
+    if (!force && indexIsFresh()) return summarizeIndex(out)
+    if (!rebuildInFlight) {
+      rebuildInFlight = (async () => {
+        fs.mkdirSync(config.dataDir, { recursive: true })
+        const script = path.join(packageDir, 'scripts', 'endnote_index.py')
+        const run = await runPython(config.pythonPath, [script, '--lib', config.libraryPath, '--out', out])
+        store.invalidate()
+        const built = run.ok && fs.existsSync(out) ? new IndexStore({ ...config, indexFile: out }).load() : null
+        return {
+          ok: Boolean(built && built.entries.length),
+          indexFile: out,
+          entries: built ? built.entries.length : 0,
+          withPdf: built ? built.entries.filter((entry) => entry.files.some((file) => file.exists)).length : 0,
+          output: run.output,
+        }
+      })().finally(() => { rebuildInFlight = null })
+    }
+    return rebuildInFlight
+  }
+
+  // 启动期自动重建：库文件（sdb/sdb.eni）比索引新（或索引缺失）时后台重建一次，
+  // 防止「打开 DSH 后新导入的论文检索不到」。失败只 warn，不影响工具可用性。
+  try {
+    const startupIndexFile = config.libraryPath ? preferredIndexFile(config) : ''
+    const startupSdbFile = startupIndexFile ? path.join(config.libraryPath, 'sdb', 'sdb.eni') : ''
+    const statIndex = startupIndexFile && fs.existsSync(startupIndexFile) ? fs.statSync(startupIndexFile) : null
+    const statSdb = startupSdbFile && fs.existsSync(startupSdbFile) ? fs.statSync(startupSdbFile) : null
+    if (statSdb && (!statIndex || statSdb.mtimeMs > statIndex.mtimeMs)) {
+      void rebuildIndexNow()
+        .then((result) => console.info(`[dsh-endnote] 启动期索引已自动重建：${result.indexFile}（${result.entries} 条）`))
+        .catch((error) => console.warn(`[dsh-endnote] 启动期自动重建索引失败：${errorMessageOf(error)}`))
+    }
+  } catch { /* 启动期探测失败不影响加载 */ }
 
   /** 面板数据：统计汇总 + 最近阅读 + 最近导入（只读，每次请求重算）。 */
   const buildPanelPayload = (recentN, addedN) => {
@@ -692,6 +746,23 @@ export function apply(ctx, rawConfig) {
         }
       },
     }), `dsh-endnote: GET ${PANEL_DATA_PATH}`)
+
+    // 重建索引：POST（面板「刷新」按钮调用；重建完成返回新统计，耗时可达数秒）。
+    webCtx.effect(() => webServer.register({
+      kind: 'exact',
+      path: REBUILD_INDEX_PATH,
+      handler: async (req, res) => {
+        try {
+          const rejection = connection.requestRejection(req)
+          if (rejection !== undefined) { res.statusCode = rejection; res.end(); return }
+          if (req.method !== 'POST') { res.statusCode = 405; res.setHeader('allow', 'POST'); res.end(); return }
+          const result = await rebuildIndexNow()
+          sendJson(res, result.ok ? 200 : 500, result)
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: errorMessageOf(error) })
+        }
+      },
+    }), `dsh-endnote: POST ${REBUILD_INDEX_PATH}`)
 
     // 打开文件夹：POST {path}，绝对路径 + 确实是目录才执行。
     webCtx.effect(() => webServer.register({

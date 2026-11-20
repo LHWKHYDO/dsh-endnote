@@ -87,7 +87,7 @@ git clone https://github.com/<your-name>/dsh-endnote.git
 - **最近阅读**：条数可选（5/10/20/50），每行显示标题、已读状态、评分与最近阅读时间；点标题直接在右侧栏打开这篇 PDF（关掉标签后就从这里重开），点文件夹路径用系统文件管理器打开所在目录。
 - **最近导入**：顶部「显示」下拉框可选「最近阅读 / 最近导入 / 两者都显示」，按 EndNote 入库时间倒序。
 - **新标签页入口**：右侧栏「+ 新标签页」导航里有「EndNote 最近阅读」页面——点击即列出最近阅读的文献（无需先打开任何 PDF），点标题在 EndNote PDF 标签页打开；「开始」页与「更多工具」菜单里也有同名卡片。
-- **刷新**：重新拉取展示数据（阅读记录、读状态变化点刷新即见；新导入文献要先 `endnote_rebuild` 才进统计）。
+- **刷新**：先重建索引再拉取展示数据——统计、最近导入与新论文检索立即同步最新（重建耗时数秒，按钮显示「重建索引中…」）。另外每次 DSH 启动时，若检测到 EndNote 库比索引新，会自动后台重建一次，无需手动操作。
 - **侧栏入口**：页面顶部一行显示侧栏入口状态；已注册可点「打开面板」，未注册（客户端半边晚于页面加载）可点「固定到侧栏」补注册，或用「重新加载页面」刷新一次。入口本身注册一次后每次启动都会自动常驻左侧栏。
 
 数据走同源路由：`GET /dsh-endnote/panel-data`、`POST /dsh-endnote/open-folder`、`GET|HEAD /dsh-endnote/pdf-bytes?path=<绝对路径>`（支持 `Range`，供编辑器自己按需拉取 PDF 字节）、`GET|POST /dsh-endnote/pdf-annotations`、`POST /dsh-endnote/export-pdf`、`GET /dsh-endnote/vendor/pdfjs/*`，与官方 open-in-app 同款注册方式——每条请求先过宿主 `connection` 的 Host/Origin 栅栏，打开文件夹只接受绝对路径且必须是真实目录，字节与标注路由只接受绝对 `.pdf` 路径。`webServer` / `connection` 缺失时路由自动降级，六个工具不受影响。

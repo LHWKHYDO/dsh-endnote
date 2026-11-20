@@ -20,6 +20,7 @@ window.__ModuleLoader__.load({
     // 与主机半边 index.js 对齐的同源路由（document-relative，官方 open-in-app 同款）。
     const PANEL_DATA_PATH = '/dsh-endnote/panel-data'
     const OPEN_FOLDER_PATH = '/dsh-endnote/open-folder'
+    const REBUILD_INDEX_PATH = '/dsh-endnote/rebuild-index'
     // PDF 原始字节（支持 Range）：编辑器自己按需拉取，不依赖宿主整包注入。
     const PDF_BYTES_PATH = '/dsh-endnote/pdf-bytes'
     // 右侧栏「最近阅读」回调：由 apply() 在拿到 sidebarRight 时设置。
@@ -60,7 +61,8 @@ window.__ModuleLoader__.load({
         unavailable: 'Configuration unavailable for this plugin entry.',
         dash: 'Library dashboard',
         refresh: 'Refresh',
-        refreshing: 'Refreshing…',
+        refreshing: 'Rebuilding index…',
+        rebuildFailed: 'Index rebuild failed',
         countLabel: 'Rows',
         viewLabel: 'Show',
         viewBoth: 'Both lists',
@@ -123,7 +125,8 @@ window.__ModuleLoader__.load({
         unavailable: '该插件条目的配置不可用。',
         dash: '文献库概览',
         refresh: '刷新',
-        refreshing: '刷新中…',
+        refreshing: '重建索引中…',
+        rebuildFailed: '索引重建失败',
         countLabel: '条数',
         viewLabel: '显示',
         viewBoth: '两者都显示',
@@ -571,6 +574,8 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState('')
       const [notice, setNotice] = React.useState('')
       const [data, setData] = React.useState(null)
+      const aliveRef = React.useRef(true)
+      React.useEffect(() => () => { aliveRef.current = false }, [])
 
       React.useEffect(() => {
         let alive = true
@@ -693,7 +698,22 @@ window.__ModuleLoader__.load({
               className: 'dshEndnoteCfg_btn dshEndnoteCfg_btnSm',
               type: 'button',
               disabled: busy,
-              onClick: () => setTick((n) => n + 1),
+              onClick: () => {
+                if (busy) return
+                // 刷新 = 重建索引再取数：保证统计与最近导入包含最新论文。
+                setBusy(true)
+                setNotice('')
+                fetch(REBUILD_INDEX_PATH, { method: 'POST', headers: { accept: 'application/json' } })
+                  .then((response) => {
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+                    return response.json()
+                  })
+                  .then((json) => {
+                    if (!json || json.ok !== true) throw new Error(String((json && json.error) || 'rebuild failed'))
+                  })
+                  .catch((rebuildError) => setNotice(`${t('rebuildFailed')} (${String((rebuildError && rebuildError.message) || rebuildError)})`))
+                  .finally(() => { if (aliveRef.current) setTick((n) => n + 1) })
+              },
             }, busy ? t('refreshing') : t('refresh')),
           ),
         ),
@@ -1659,6 +1679,11 @@ window.__ModuleLoader__.load({
       const hostRef = React.useRef(null)
       const canvasRef = React.useRef(null)
       const textRef = React.useRef(null)
+      // 上一次成功启动渲染时的页宽；用于缩放限流判断「是否已有旧图可显示」。
+      const lastRenderedWidthRef = React.useRef(0)
+      // 同一页的页面代理与文本内容缓存（缩放/限流重渲染时复用，见渲染 effect）。
+      const proxyRef = React.useRef(null)
+      const textCacheRef = React.useRef(null)
       const [dims, setDims] = React.useState(null)
       const [draftRect, setDraftRect] = React.useState(null)
       const [editing, setEditing] = React.useState(null)
@@ -1678,13 +1703,34 @@ window.__ModuleLoader__.load({
         let live = true
         let proxy = null
         let task = null
+        let timer = null
         // 宽度还没量出来时不渲染：0 宽度会先画一次，随后宽度到位又抢同一个
         // canvas，PDF.js 会直接抛「same canvas during multiple render()」。
         if (!doc || !(width > 0) || active === false) return undefined
-        ;(async () => {
+        // 连续缩放/拖侧栏时限流：已有旧图时延迟 90ms 再启动新渲染，
+        // 避免每个宽度像素都触发一轮 getPage+render（闪烁与卡顿的来源）。
+        if (lastRenderedWidthRef.current > 0 && lastRenderedWidthRef.current !== width) {
+          timer = setTimeout(run, 90)
+          return () => {
+            live = false
+            if (timer) clearTimeout(timer)
+          }
+        }
+        run()
+        function run() {
+          if (!live) return
+          ;(async () => {
           try {
             const pdfjs = await loadPdfjs()
-            proxy = await doc.getPage(pageNumber)
+            // 页面代理与文本内容缓存：同一页缩放时不重新 getPage / getTextContent，
+            // 直接复用上次的 proxy 与文本，缩放只剩一次纯渲染。
+            const cachedProxy = proxyRef.current
+            if (cachedProxy && cachedProxy.doc === doc && cachedProxy.pageNumber === pageNumber) {
+              proxy = cachedProxy.proxy
+            } else {
+              proxy = await doc.getPage(pageNumber)
+              proxyRef.current = { doc, pageNumber, proxy }
+            }
             if (!live) return
             const base = proxy.getViewport({ scale: 1 })
             const scale = width / base.width
@@ -1693,29 +1739,51 @@ window.__ModuleLoader__.load({
             const textHost = textRef.current
             if (!canvas || !textHost) return
             const dpr = Math.min(2, globalThis.devicePixelRatio || 1)
-            canvas.width = Math.max(1, Math.round(viewport.width * dpr))
-            canvas.height = Math.max(1, Math.round(viewport.height * dpr))
-            const context = canvas.getContext('2d')
+            // 缩放防闪：先在离屏 canvas 上按新尺寸渲染，画完同一帧内替换可见
+            // canvas 的位图；期间旧位图只被 CSS 拉伸（模糊一下），不会清空白闪。
+            const stage = globalThis.document
+              ? globalThis.document.createElement('canvas')
+              : null
+            if (!stage) return
+            stage.width = Math.max(1, Math.round(viewport.width * dpr))
+            stage.height = Math.max(1, Math.round(viewport.height * dpr))
+            const context = stage.getContext('2d')
             if (!context) throw new Error('2D canvas unavailable')
             context.setTransform(dpr, 0, 0, dpr, 0, 0)
             // 尺寸先定：页面高度是所有标注定位的基准，不能等渲染。
             setDims({ width: viewport.width, height: viewport.height })
-            task = proxy.render({ canvasContext: context, viewport, canvas })
+            task = proxy.render({ canvasContext: context, viewport, canvas: stage })
+            lastRenderedWidthRef.current = width
             // 不等 render 完成：窗口被遮挡/后台时浏览器会暂停 rAF，
             // pdf.js 的渲染循环随之挂起，promise 永远不 resolve。
             // 让它自己跑，失败再报错，文本层与交互不必被它拖住。
             void task.promise
-              .then(() => { task = null })
+              .then(() => {
+                task = null
+                if (!live) return
+                // 同一帧内完成「改尺寸 + 贴新图」，中间不产生空白帧。
+                const visible = canvasRef.current
+                if (!visible) return
+                visible.width = stage.width
+                visible.height = stage.height
+                const target = visible.getContext('2d')
+                if (!target) return
+                target.drawImage(stage, 0, 0)
+              })
               .catch((error) => {
                 task = null
                 const name = error && error.name ? String(error.name) : ''
                 if (name === 'RenderingCancelledException') return
                 if (live && props.onError) props.onError(error)
               })
-            const textContent = await Promise.race([
-              proxy.getTextContent(),
-              new Promise((resolve) => setTimeout(() => resolve(null), 5000)),
-            ])
+            const cachedText = textCacheRef.current
+            const textContent = cachedText && cachedText.doc === doc && cachedText.pageNumber === pageNumber
+              ? cachedText.text
+              : await Promise.race([
+                  proxy.getTextContent(),
+                  new Promise((resolve) => setTimeout(() => resolve(null), 5000)),
+                ])
+            if (textContent) textCacheRef.current = { doc, pageNumber, text: textContent }
             if (!live || !textContent) return
             buildTextLayer(textHost, pdfjs, textContent, viewport)
           } catch (error) {
@@ -1724,12 +1792,26 @@ window.__ModuleLoader__.load({
             if (live && name !== 'RenderingCancelledException' && props.onError) props.onError(error)
           }
         })()
+        }
         return () => {
           live = false
+          if (timer) clearTimeout(timer)
           try { if (task) task.cancel() } catch { /* 已完成 */ }
-          try { if (proxy) proxy.cleanup() } catch { /* 页面已释放 */ }
+          // 不在这里 cleanup 页面代理：proxyRef 缓存要跨缩放复用（见下方卸载 effect）。
         }
       }, [doc, pageNumber, width, active])
+
+      // 组件卸载或换文档/换页时释放缓存的页面代理（渲染 effect 不再负责）。
+      React.useEffect(() => {
+        return () => {
+          const cached = proxyRef.current
+          proxyRef.current = null
+          textCacheRef.current = null
+          if (cached) {
+            try { if (cached.proxy && typeof cached.proxy.cleanup === 'function') cached.proxy.cleanup() } catch { /* 已释放 */ }
+          }
+        }
+      }, [doc, pageNumber])
 
       /** 指针坐标 → 页面归一化坐标。 */
       const pointOf = (event) => {
